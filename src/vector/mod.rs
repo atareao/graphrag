@@ -26,8 +26,11 @@ pub fn norm(v: &[f32]) -> f32 {
 /// Normaliza un vector a longitud unitaria
 pub fn normalize(v: &[f32]) -> Vec<f32> {
     let n = norm(v);
-    if n == 0.0 { v.to_vec() }
-    else { v.iter().map(|x| x / n).collect() }
+    if n == 0.0 {
+        v.to_vec()
+    } else {
+        v.iter().map(|x| x / n).collect()
+    }
 }
 
 /// Similitud coseno entre dos vectores normalizados
@@ -42,6 +45,8 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 pub fn cosine_similarity_raw(a: &[f32], b: &[f32]) -> f32 {
     let na = norm(a);
     let nb = norm(b);
-    if na == 0.0 || nb == 0.0 { return 0.0; }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
     dot(a, b) / (na * nb)
 }

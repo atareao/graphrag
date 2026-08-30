@@ -1,19 +1,19 @@
+mod chunking;
+mod config;
 mod db;
 mod embed;
-mod vector;
-mod chunking;
-mod ner;
 mod graph;
+mod mcp;
+mod ner;
 mod search;
 mod seed;
-mod mcp;
-mod config;
+mod vector;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
-use anyhow::Result;
-use std::path::Path;
 use log::debug;
+use std::path::Path;
 
 /// GraphRAG — Motor de búsqueda híbrida con vectores + grafos de conocimiento
 ///
@@ -87,6 +87,9 @@ enum Commands {
         /// Peso mínimo de arista para expansión
         #[arg(long)]
         min_weight: Option<f64>,
+        /// Solo notas (sin entidades ni tags)
+        #[arg(long)]
+        notes_only: bool,
     },
     /// Búsqueda solo por grafo desde un nodo
     Graph {
@@ -182,8 +185,10 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = load_config(&cli.config);
-    debug!("Config loaded: db={}, ollama_url={}, embed_model={}, ner_model={}",
-           cfg.db, cfg.ollama_url, cfg.embed_model, cfg.ner_model);
+    debug!(
+        "Config loaded: db={}, ollama_url={}, embed_model={}, ner_model={}",
+        cfg.db, cfg.ollama_url, cfg.embed_model, cfg.ner_model
+    );
 
     match cli.command {
         Commands::Init { action } => match action {
@@ -193,41 +198,114 @@ fn main() -> Result<()> {
             }
             InitCommands::Neovim { output } => cmd_neovim(output, &cfg),
         },
-        Commands::Build { repo, db, embed_model, ner_model, ollama_url } => {
+        Commands::Build {
+            repo,
+            db,
+            embed_model,
+            ner_model,
+            ollama_url,
+        } => {
             let db = if db == "graphrag.db" { cfg.db } else { db };
-            let repo = if repo == "." && !cfg.notes_dir.is_empty() { cfg.notes_dir.clone() } else { repo };
-            let embed_model = if embed_model == "nomic-embed-text" { cfg.embed_model } else { embed_model };
-            let ner_model = if ner_model == "llama3.2:3b" { cfg.ner_model } else { ner_model };
-            let ollama_url = if ollama_url == "http://localhost:11434" { cfg.ollama_url } else { ollama_url };
+            let repo = if repo == "." && !cfg.notes_dir.is_empty() {
+                cfg.notes_dir.clone()
+            } else {
+                repo
+            };
+            let embed_model = if embed_model == "nomic-embed-text" {
+                cfg.embed_model
+            } else {
+                embed_model
+            };
+            let ner_model = if ner_model == "llama3.2:3b" {
+                cfg.ner_model
+            } else {
+                ner_model
+            };
+            let ollama_url = if ollama_url == "http://localhost:11434" {
+                cfg.ollama_url
+            } else {
+                ollama_url
+            };
             debug!("Comando: build repo={}, db={}", repo, db);
-            cmd_build(&repo, &db, &ollama_url, &ner_model, &embed_model, cfg.num_threads)
+            cmd_build(
+                &repo,
+                &db,
+                &ollama_url,
+                &ner_model,
+                &embed_model,
+                cfg.num_threads,
+            )
         }
-        Commands::Search { query, db, k, depth, alpha, ollama, ollama_url, embed_model, vector_only, min_weight } => {
+        Commands::Search {
+            query,
+            db,
+            k,
+            depth,
+            alpha,
+            ollama,
+            ollama_url,
+            embed_model,
+            vector_only,
+            min_weight,
+            notes_only,
+        } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let k = if k == 5 { cfg.k } else { k };
             let depth = if depth == 2 { cfg.depth } else { depth };
-            let alpha_val = if (alpha - 0.7).abs() < 0.01 { cfg.alpha } else { alpha };
-            let ollama_url = if ollama_url == "http://localhost:11434" { &cfg.ollama_url } else { &ollama_url };
-            let embed_model = if embed_model == "nomic-embed-text" { &cfg.embed_model } else { &embed_model };
-            debug!("Comando: search query='{}', k={}, depth={}", query, k, depth);
-            cmd_search(&query, db, k, depth, alpha_val, ollama, ollama_url, embed_model, vector_only, min_weight)
+            let alpha_val = if (alpha - 0.7).abs() < 0.01 {
+                cfg.alpha
+            } else {
+                alpha
+            };
+            let ollama_url = if ollama_url == "http://localhost:11434" {
+                &cfg.ollama_url
+            } else {
+                &ollama_url
+            };
+            let embed_model = if embed_model == "nomic-embed-text" {
+                &cfg.embed_model
+            } else {
+                &embed_model
+            };
+            debug!(
+                "Comando: search query='{}', k={}, depth={}",
+                query, k, depth
+            );
+            cmd_search(
+                &query,
+                db,
+                k,
+                depth,
+                alpha_val,
+                ollama,
+                ollama_url,
+                embed_model,
+                vector_only,
+                min_weight,
+                notes_only,
+            )
         }
         Commands::Graph { label, db, depth } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let depth = if depth == 2 { cfg.depth } else { depth };
             debug!("Comando: graph label='{}', depth={}", label, depth);
             cmd_graph(&label, db, depth)
-        },
+        }
         Commands::Fts { query, db, limit } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             debug!("Comando: fts query='{}', limit={}", query, limit);
             cmd_fts(&query, db, limit)
-        },
-        Commands::Path { from, to, db, max_depth } => {
+        }
+        Commands::Path {
+            from,
+            to,
+            db,
+            max_depth,
+        } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             debug!("Comando: path from='{}', to='{}'", from, to);
             cmd_path(&from, &to, db, max_depth)
-        },
+        }
         Commands::Seed { db } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             debug!("Comando: seed db={}", db);
@@ -238,10 +316,22 @@ fn main() -> Result<()> {
             debug!("Comando: reset db={}", db);
             cmd_reset(db)
         }
-        Commands::Mcp { db, ollama_url, embed_model } => {
+        Commands::Mcp {
+            db,
+            ollama_url,
+            embed_model,
+        } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
-            let ollama_url = if ollama_url == "http://localhost:11434" { &cfg.ollama_url } else { &ollama_url };
-            let embed_model = if embed_model == "nomic-embed-text" { &cfg.embed_model } else { &embed_model };
+            let ollama_url = if ollama_url == "http://localhost:11434" {
+                &cfg.ollama_url
+            } else {
+                &ollama_url
+            };
+            let embed_model = if embed_model == "nomic-embed-text" {
+                &cfg.embed_model
+            } else {
+                &embed_model
+            };
             debug!("Comando: mcp db={}", db);
             mcp::run_server(db, ollama_url, embed_model, cfg.num_threads)
         }
@@ -415,10 +505,20 @@ fn cmd_reset(db: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_build(repo: &str, db: &str, ollama_url: &str, ner_model: &str, embed_model: &str, num_threads: usize) -> Result<()> {
+fn cmd_build(
+    repo: &str,
+    db: &str,
+    ollama_url: &str,
+    ner_model: &str,
+    embed_model: &str,
+    num_threads: usize,
+) -> Result<()> {
     println!("🔨 Construyendo grafo de conocimiento desde: {}", repo);
     println!("   Base de datos: {}", db);
-    println!("   Ollama: {} (NER: {}, Embeddings: {})", ollama_url, ner_model, embed_model);
+    println!(
+        "   Ollama: {} (NER: {}, Embeddings: {})",
+        ollama_url, ner_model, embed_model
+    );
 
     // Verificar Ollama
     let ollama = embed::ollama::OllamaClient::new(ollama_url, embed_model);
@@ -435,15 +535,24 @@ fn cmd_build(repo: &str, db: &str, ollama_url: &str, ner_model: &str, embed_mode
         eprintln!("💡  Para extraer entidades: ollama pull {}", ner_model);
     }
 
-    let stats = graph::build::build_graph(repo, db, ollama_url, ner_model, embed_model, num_threads)?;
+    let stats =
+        graph::build::build_graph(repo, db, ollama_url, ner_model, embed_model, num_threads)?;
     println!("\n{}", stats);
     Ok(())
 }
 
 fn cmd_search(
-    query: &str, db: &str, k: usize, depth: i32, alpha: f64,
-    use_ollama: bool, ollama_url: &str, embed_model: &str,
-    vector_only: bool, min_weight: Option<f64>,
+    query: &str,
+    db: &str,
+    k: usize,
+    depth: i32,
+    alpha: f64,
+    use_ollama: bool,
+    ollama_url: &str,
+    embed_model: &str,
+    vector_only: bool,
+    min_weight: Option<f64>,
+    notes_only: bool,
 ) -> Result<()> {
     let ollama = if use_ollama {
         Some(embed::ollama::OllamaClient::new(ollama_url, embed_model))
@@ -454,10 +563,18 @@ fn cmd_search(
     let mut hs = search::HybridSearch::new(db, ollama)?;
 
     println!("\n🔍 Consulta: '{}'", query);
-    println!("   k={}, depth={}, alpha={}, embed={}",
-             k, depth, alpha, if use_ollama { "Ollama" } else { "sintético" });
+    println!(
+        "   k={}, depth={}, alpha={}, embed={}",
+        k,
+        depth,
+        alpha,
+        if use_ollama { "Ollama" } else { "sintético" }
+    );
     if let Some(mw) = min_weight {
         println!("   min_weight={}", mw);
+    }
+    if notes_only {
+        println!("   solo notas");
     }
     println!();
 
@@ -466,7 +583,7 @@ fn cmd_search(
         hs.vector_only(query, k)?
     } else {
         println!("🧠 HYBRID SEARCH (depth={})\n{}", depth, "─".repeat(50));
-        hs.hybrid_search(query, k, depth, alpha, min_weight)?
+        hs.hybrid_search(query, k, depth, alpha, min_weight, notes_only)?
     };
 
     if results.is_empty() {
@@ -481,8 +598,10 @@ fn cmd_search(
             String::new()
         };
         let n_count = r.neighbors.len();
-        println!("   {:>10.3}  [{:8}] {}{}  (vecinos: {})",
-                 r.score, r.r#type, r.label, file_info, n_count);
+        println!(
+            "   {:>10.3}  [{:8}] {}{}  (vecinos: {})",
+            r.score, r.r#type, r.label, file_info, n_count
+        );
     }
 
     // Mostrar vecinos del primer resultado
@@ -544,7 +663,10 @@ fn cmd_fts(query: &str, db: &str, limit: usize) -> Result<()> {
         } else {
             String::new()
         };
-        println!("   {:>10.3}  [{}] {}{}", r.score, r.r#type, r.label, file_info);
+        println!(
+            "   {:>10.3}  [{}] {}{}",
+            r.score, r.r#type, r.label, file_info
+        );
     }
 
     Ok(())
@@ -562,8 +684,10 @@ fn cmd_path(from: &str, to: &str, db: &str, max_depth: i32) -> Result<()> {
             println!("   {}", nodes.join(" → "));
         }
         None => {
-            println!("⚠️  No se encontró camino entre '{}' y '{}' (depth<={})",
-                     from, to, max_depth);
+            println!(
+                "⚠️  No se encontró camino entre '{}' y '{}' (depth<={})",
+                from, to, max_depth
+            );
         }
     }
 
@@ -574,8 +698,14 @@ fn cmd_seed(db: &str) -> Result<()> {
     println!("🌱 Generando base de datos de demostración...");
     seed::demo_data::create_demo_db(db)?;
     println!("\n💡 Ejemplos de uso:");
-    println!("   graphrag search \"seguridad en contenedores\" --db {}", db);
-    println!("   graphrag search \"bases de datos Python\" --db {} --k 5 --depth 2", db);
+    println!(
+        "   graphrag search \"seguridad en contenedores\" --db {}",
+        db
+    );
+    println!(
+        "   graphrag search \"bases de datos Python\" --db {} --k 5 --depth 2",
+        db
+    );
     println!("   graphrag stats --db {}", db);
     println!("   graphrag fts \"Docker\" --db {}", db);
     println!("   graphrag path \"Docker\" \"SQLite\" --db {}", db);

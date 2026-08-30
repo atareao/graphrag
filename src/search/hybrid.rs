@@ -1,12 +1,12 @@
-use std::collections::HashSet;
 use anyhow::Result;
+use log::debug;
 use rusqlite::Connection;
 use serde::Serialize;
-use log::debug;
+use std::collections::HashSet;
 
 use crate::embed::ollama::OllamaClient;
-use crate::vector::{self, synthetic};
 use crate::graph::expand::{self, Neighbor};
+use crate::vector::{self, synthetic};
 
 /// Un resultado individual de la búsqueda híbrida
 #[derive(Debug, Clone, Serialize)]
@@ -22,7 +22,14 @@ pub struct SearchResult {
 }
 
 impl SearchResult {
-    fn new(id: i64, label: String, type_: String, score: f64, content: String, file: String) -> Self {
+    fn new(
+        id: i64,
+        label: String,
+        type_: String,
+        score: f64,
+        content: String,
+        file: String,
+    ) -> Self {
         Self {
             id,
             label,
@@ -66,8 +73,16 @@ impl HybridSearch {
         let conn = Connection::open(db_path)?;
         let use_synthetic = ollama.is_none();
         let dims = ollama.as_ref().map_or(1024, |o| o.embedding_dimension());
-        debug!("HybridSearch abierto: db={}, ollama={}, dims={}",
-               db_path, if ollama.is_some() { "sí" } else { "no (sintético)" }, dims);
+        debug!(
+            "HybridSearch abierto: db={}, ollama={}, dims={}",
+            db_path,
+            if ollama.is_some() {
+                "sí"
+            } else {
+                "no (sintético)"
+            },
+            dims
+        );
 
         Ok(Self {
             conn,
@@ -95,9 +110,16 @@ impl HybridSearch {
             synthetic::synthetic_embedding(text, self.dims)
         };
         let preview: String = text.chars().take(40).collect();
-        debug!("Embedding generado: '{}'... ({}d, {})",
-               preview, vec.len(),
-               if self.ollama.is_some() { "Ollama" } else { "sintético" });
+        debug!(
+            "Embedding generado: '{}'... ({}d, {})",
+            preview,
+            vec.len(),
+            if self.ollama.is_some() {
+                "Ollama"
+            } else {
+                "sintético"
+            }
+        );
 
         self.embed_cache.insert(text.to_string(), vec.clone());
         Ok(vec)
@@ -109,9 +131,9 @@ impl HybridSearch {
             return Ok(());
         }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT id, label, type, embedding FROM nodes WHERE embedding IS NOT NULL"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, label, type, embedding FROM nodes WHERE embedding IS NOT NULL")?;
 
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
@@ -125,11 +147,18 @@ impl HybridSearch {
             let (id, label, type_, blob) = row?;
             let vec = vector::blob_to_vector(&blob)?;
             self.all_vecs.push(vec);
-            self.all_meta.push(NodeMeta { id, label, r#type: type_ });
+            self.all_meta.push(NodeMeta {
+                id,
+                label,
+                r#type: type_,
+            });
         }
 
         self.loaded = true;
-        debug!("Embeddings cargados: {} nodos con vector.", self.all_vecs.len());
+        debug!(
+            "Embeddings cargados: {} nodos con vector.",
+            self.all_vecs.len()
+        );
         Ok(())
     }
 
@@ -192,6 +221,7 @@ impl HybridSearch {
         depth: i32,
         alpha: f64,
         min_weight: Option<f64>,
+        notes_only: bool,
     ) -> Result<Vec<SearchResult>> {
         // === FASE 1: Búsqueda vectorial ===
         let query_vec = self.embed(query)?;
@@ -207,7 +237,8 @@ impl HybridSearch {
         }
 
         // Calcular similitud coseno con todos los vectores
-        let mut sims: Vec<(usize, f64)> = self.all_vecs
+        let mut sims: Vec<(usize, f64)> = self
+            .all_vecs
             .iter()
             .enumerate()
             .map(|(i, v)| {
@@ -224,9 +255,12 @@ impl HybridSearch {
             return Ok(Vec::new());
         }
 
-        debug!("FASE 1 — Vector search: top {} de {} nodos. Mejor score: {:.4}",
-               top_k.len(), self.all_vecs.len(),
-               top_k.first().map(|(_, s)| s).unwrap_or(&0.0));
+        debug!(
+            "FASE 1 — Vector search: top {} de {} nodos. Mejor score: {:.4}",
+            top_k.len(),
+            self.all_vecs.len(),
+            top_k.first().map(|(_, s)| s).unwrap_or(&0.0)
+        );
 
         // === FASE 2: Reranking ===
         let query_lower = query.to_lowercase();
@@ -254,10 +288,15 @@ impl HybridSearch {
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        debug!("FASE 2 — Reranking: {} candidatos. Mejor: '{}' ({:.4})",
-               candidates.len(),
-               candidates.first().map(|(_, m)| &m.label).unwrap_or(&String::new()),
-               candidates.first().map(|(s, _)| s).unwrap_or(&0.0));
+        debug!(
+            "FASE 2 — Reranking: {} candidatos. Mejor: '{}' ({:.4})",
+            candidates.len(),
+            candidates
+                .first()
+                .map(|(_, m)| &m.label)
+                .unwrap_or(&String::new()),
+            candidates.first().map(|(s, _)| s).unwrap_or(&0.0)
+        );
 
         // === FASE 3: Expansión por grafo ===
         let mut seen_ids: HashSet<i64> = HashSet::new();
@@ -309,16 +348,30 @@ impl HybridSearch {
             }
         }
 
-        debug!("FASE 3 — Graph expansion: {} resultados finales (depth={})", results.len(), depth);
+        debug!(
+            "FASE 3 — Graph expansion: {} resultados finales (depth={})",
+            results.len(),
+            depth
+        );
 
         // Orden final y límite
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(k * 2);
 
         // Normalizar scores (min-max)
         let (min_score, max_score) = if !results.is_empty() {
-            let max_s = results.iter().map(|r| r.score).fold(f64::NEG_INFINITY, f64::max);
-            let min_s = results.iter().map(|r| r.score).fold(f64::INFINITY, f64::min);
+            let max_s = results
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_s = results
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::INFINITY, f64::min);
             if max_s > min_s {
                 for r in &mut results {
                     r.score = (r.score - min_s) / (max_s - min_s);
@@ -328,23 +381,36 @@ impl HybridSearch {
         } else {
             (0.0, 0.0)
         };
-        debug!("Normalización min-max: score range [{:.4}, {:.4}]", min_score, max_score);
+        debug!(
+            "Normalización min-max: score range [{:.4}, {:.4}]",
+            min_score, max_score
+        );
+
+        // Filtrar solo notas si se solicitó
+        let results = if notes_only {
+            results.into_iter().filter(|r| r.r#type == "note").collect()
+        } else {
+            results
+        };
 
         Ok(results)
     }
 
     /// Búsqueda solo vectorial (sin expansión por grafo)
     pub fn vector_only(&mut self, query: &str, k: usize) -> Result<Vec<SearchResult>> {
-        self.hybrid_search(query, k, 0, 0.7, None)
+        self.hybrid_search(query, k, 0, 0.7, None, false)
     }
 
     /// Búsqueda solo por grafo desde un nodo
     pub fn graph_only(&self, node_label: &str, depth: i32) -> Result<Vec<Neighbor>> {
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM nodes WHERE label = ?1",
-            rusqlite::params![node_label],
-            |row| row.get(0),
-        ).map_err(|_| anyhow::anyhow!("Nodo '{}' no encontrado", node_label))?;
+        let id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM nodes WHERE label = ?1",
+                rusqlite::params![node_label],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("Nodo '{}' no encontrado", node_label))?;
 
         expand::expand_neighbors(&self.conn, id, depth)
     }
@@ -357,7 +423,7 @@ impl HybridSearch {
              JOIN nodes n ON notes_fts.rowid = n.id
              WHERE notes_fts MATCH ?1
              ORDER BY rank
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
 
         let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
@@ -371,7 +437,7 @@ impl HybridSearch {
                 .ok()
                 .and_then(|v| {
                     v.get("content")
-                     .and_then(|c| c.as_str().map(|s| s.to_owned()))
+                        .and_then(|c| c.as_str().map(|s| s.to_owned()))
                 })
                 .unwrap_or_default();
 
@@ -391,22 +457,41 @@ impl HybridSearch {
 
     /// Estadísticas de la base de datos
     pub fn stats(&self) -> Result<DbStats> {
-        let nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-        let notes: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE type='note'", [], |r| r.get(0)
-        )?;
+        let nodes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        let notes: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM nodes WHERE type='note'", [], |r| {
+                    r.get(0)
+                })?;
         let entities: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE type != 'note' AND type != 'tag'", [], |r| r.get(0)
+            "SELECT COUNT(*) FROM nodes WHERE type != 'note' AND type != 'tag'",
+            [],
+            |r| r.get(0),
         )?;
-        let tags: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE type='tag'", [], |r| r.get(0)
-        )?;
-        let edges: i64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let tags: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM nodes WHERE type='tag'", [], |r| {
+                    r.get(0)
+                })?;
+        let edges: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
         let with_emb: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL", [], |r| r.get(0)
+            "SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL",
+            [],
+            |r| r.get(0),
         )?;
 
-        Ok(DbStats { nodes, notes, entities, tags, edges, with_embeddings: with_emb })
+        Ok(DbStats {
+            nodes,
+            notes,
+            entities,
+            tags,
+            edges,
+            with_embeddings: with_emb,
+        })
     }
 
     #[allow(dead_code)]
