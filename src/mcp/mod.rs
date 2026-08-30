@@ -12,11 +12,11 @@
 //!
 //! Luego se configura en claude_desktop_config.json como servidor MCP.
 
-use std::io::{self, BufRead, Write};
 use anyhow::Result;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use log::{info, error};
+use std::io::{self, BufRead, Write};
 
 use crate::graph;
 use crate::search::HybridSearch;
@@ -63,14 +63,23 @@ struct JsonRpcError {
 
 impl JsonRpcResponse {
     fn success(id: Option<Value>, result: Value) -> Self {
-        Self { jsonrpc: "2.0".into(), result: Some(result), error: None, id }
+        Self {
+            jsonrpc: "2.0".into(),
+            result: Some(result),
+            error: None,
+            id,
+        }
     }
 
     fn error(id: Option<Value>, code: i32, message: impl Into<String>) -> Self {
         Self {
             jsonrpc: "2.0".into(),
             result: None,
-            error: Some(JsonRpcError { code, message: message.into(), data: None }),
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
             id,
         }
     }
@@ -225,7 +234,8 @@ fn resource_definitions() -> Value {
 // ---------------------------------------------------------------------------
 
 fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
-    let client_version = req.params
+    let client_version = req
+        .params
         .as_ref()
         .and_then(|p| p.get("protocolVersion"))
         .and_then(|v| v.as_str())
@@ -233,33 +243,43 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
 
     info!("Cliente MCP conectado (protocolo: {})", client_version);
 
-    JsonRpcResponse::success(req.id.clone(), json!({
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {
-            "tools": {},
-            "resources": {}
-        },
-        "serverInfo": {
-            "name": "graphrag",
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    }))
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {
+                "tools": {},
+                "resources": {}
+            },
+            "serverInfo": {
+                "name": "graphrag",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+    )
 }
 
 fn handle_tools_list(req: &JsonRpcRequest) -> JsonRpcResponse {
-    JsonRpcResponse::success(req.id.clone(), json!({
-        "tools": tool_definitions()
-    }))
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "tools": tool_definitions()
+        }),
+    )
 }
 
 fn handle_resources_list(req: &JsonRpcRequest) -> JsonRpcResponse {
-    JsonRpcResponse::success(req.id.clone(), json!({
-        "resources": resource_definitions()
-    }))
+    JsonRpcResponse::success(
+        req.id.clone(),
+        json!({
+            "resources": resource_definitions()
+        }),
+    )
 }
 
 fn handle_resources_read(req: &JsonRpcRequest, state: &McpState) -> JsonRpcResponse {
-    let uri = match req.params
+    let uri = match req
+        .params
         .as_ref()
         .and_then(|p| p.get("uri"))
         .and_then(|u| u.as_str())
@@ -279,30 +299,50 @@ fn handle_resources_read(req: &JsonRpcRequest, state: &McpState) -> JsonRpcRespo
             handle_resource_node_by_label(&state.db_path, id)
         }
         u => {
-            return JsonRpcResponse::error(req.id.clone(), -32602, format!("Unknown resource URI: {}", u));
+            return JsonRpcResponse::error(
+                req.id.clone(),
+                -32602,
+                format!("Unknown resource URI: {}", u),
+            );
         }
     };
 
     match result {
-        Ok(text) => JsonRpcResponse::success(req.id.clone(), json!({
-            "contents": [{
-                "uri": uri,
-                "mimeType": "application/json",
-                "text": text
-            }]
-        })),
-        Err(e) => JsonRpcResponse::error(req.id.clone(), -32603, format!("Error reading resource: {}", e)),
+        Ok(text) => JsonRpcResponse::success(
+            req.id.clone(),
+            json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": text
+                }]
+            }),
+        ),
+        Err(e) => JsonRpcResponse::error(
+            req.id.clone(),
+            -32603,
+            format!("Error reading resource: {}", e),
+        ),
     }
 }
 
 fn handle_tools_call(req: &JsonRpcRequest, state: &McpState) -> JsonRpcResponse {
-    let name = match req.params.as_ref().and_then(|p| p.get("name")).and_then(|n| n.as_str()) {
+    let name = match req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+    {
         Some(n) => n,
         None => return JsonRpcResponse::error(req.id.clone(), -32602, "Missing tool 'name'"),
     };
 
     let default_args = json!({});
-    let args = req.params.as_ref().and_then(|p| p.get("arguments")).unwrap_or(&default_args);
+    let args = req
+        .params
+        .as_ref()
+        .and_then(|p| p.get("arguments"))
+        .unwrap_or(&default_args);
 
     info!("Tool call: {} args={}", name, args);
 
@@ -314,13 +354,22 @@ fn handle_tools_call(req: &JsonRpcRequest, state: &McpState) -> JsonRpcResponse 
         "path" => handle_tool_path(args, state),
         "stats" => handle_tool_stats(args, state),
         "seed" => handle_tool_seed(args, state),
-        other => return JsonRpcResponse::error(req.id.clone(), -32601, format!("Unknown tool: {}", other)),
+        other => {
+            return JsonRpcResponse::error(
+                req.id.clone(),
+                -32601,
+                format!("Unknown tool: {}", other),
+            )
+        }
     };
 
     match result {
-        Ok(text) => JsonRpcResponse::success(req.id.clone(), json!({
-            "content": [{"type": "text", "text": text}]
-        })),
+        Ok(text) => JsonRpcResponse::success(
+            req.id.clone(),
+            json!({
+                "content": [{"type": "text", "text": text}]
+            }),
+        ),
         Err(e) => JsonRpcResponse::error(req.id.clone(), -32603, format!("Error: {}", e)),
     }
 }
@@ -330,34 +379,55 @@ fn handle_tools_call(req: &JsonRpcRequest, state: &McpState) -> JsonRpcResponse 
 // ---------------------------------------------------------------------------
 
 fn handle_tool_build(args: &Value, state: &McpState) -> Result<String> {
-    let repo = args.get("repo")
+    let repo = args
+        .get("repo")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'repo' argument"))?;
 
-    let ner_model = args.get("ner_model").and_then(|v| v.as_str()).unwrap_or("llama3.2:3b");
-    let ollama_url = args.get("ollama_url").and_then(|v| v.as_str()).unwrap_or(&state.ollama_url);
-    let embed_model = args.get("embed_model").and_then(|v| v.as_str()).unwrap_or(&state.embed_model);
+    let ner_model = args
+        .get("ner_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama3.2:3b");
+    let ollama_url = args
+        .get("ollama_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&state.ollama_url);
+    let embed_model = args
+        .get("embed_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&state.embed_model);
 
-    let stats = graph::build::build_graph(repo, &state.db_path, ollama_url, ner_model, embed_model, state.num_threads)?;
+    let stats = graph::build::build_graph(
+        repo,
+        &state.db_path,
+        ollama_url,
+        ner_model,
+        embed_model,
+        state.num_threads,
+    )?;
     Ok(format!("✅ Grafo construido:\n{}", stats))
 }
 
 fn handle_tool_search(args: &Value, state: &McpState) -> Result<String> {
-    let query = args.get("query")
+    let query = args
+        .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
 
     let k = args.get("k").and_then(|v| v.as_f64()).unwrap_or(5.0) as usize;
     let depth = args.get("depth").and_then(|v| v.as_f64()).unwrap_or(2.0) as i32;
     let alpha = args.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.7);
-    let vector_only = args.get("vector_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let vector_only = args
+        .get("vector_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut hs = HybridSearch::new(&state.db_path, None)?;
 
     let results = if vector_only {
         hs.vector_only(query, k)?
     } else {
-        hs.hybrid_search(query, k, depth, alpha, None)?
+        hs.hybrid_search(query, k, depth, alpha, None, false)?
     };
 
     if results.is_empty() {
@@ -371,7 +441,14 @@ fn handle_tool_search(args: &Value, state: &McpState) -> Result<String> {
         } else {
             String::new()
         };
-        out.push_str(&format!("{}. [{:.3}] {}{} ({})\n", i + 1, r.score, r.label, file_str, r.r#type));
+        out.push_str(&format!(
+            "{}. [{:.3}] {}{} ({})\n",
+            i + 1,
+            r.score,
+            r.label,
+            file_str,
+            r.r#type
+        ));
         if !r.content.is_empty() {
             let snippet = if r.content.len() > 120 {
                 format!("{}...", &r.content[..120])
@@ -381,7 +458,9 @@ fn handle_tool_search(args: &Value, state: &McpState) -> Result<String> {
             out.push_str(&format!("   {}\n", snippet));
         }
         if !r.neighbors.is_empty() {
-            let n_list: Vec<String> = r.neighbors.iter()
+            let n_list: Vec<String> = r
+                .neighbors
+                .iter()
                 .map(|n| format!("{} (dist {})", n.label, n.distance))
                 .collect();
             out.push_str(&format!("   Vecinos: {}\n", n_list.join(", ")));
@@ -391,7 +470,8 @@ fn handle_tool_search(args: &Value, state: &McpState) -> Result<String> {
 }
 
 fn handle_tool_fts(args: &Value, state: &McpState) -> Result<String> {
-    let query = args.get("query")
+    let query = args
+        .get("query")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
 
@@ -412,7 +492,8 @@ fn handle_tool_fts(args: &Value, state: &McpState) -> Result<String> {
 }
 
 fn handle_tool_graph(args: &Value, state: &McpState) -> Result<String> {
-    let label = args.get("label")
+    let label = args
+        .get("label")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'label' argument"))?;
 
@@ -427,28 +508,42 @@ fn handle_tool_graph(args: &Value, state: &McpState) -> Result<String> {
 
     let mut out = format!("🔗 Vecinos de '{}' (depth={}):\n\n", label, depth);
     for (i, n) in neighbors.iter().enumerate() {
-        out.push_str(&format!("{}. [dist {}] {} ({})\n", i + 1, n.distance, n.label, n.r#type));
+        out.push_str(&format!(
+            "{}. [dist {}] {} ({})\n",
+            i + 1,
+            n.distance,
+            n.label,
+            n.r#type
+        ));
     }
     Ok(out)
 }
 
 fn handle_tool_path(args: &Value, state: &McpState) -> Result<String> {
-    let from = args.get("from")
+    let from = args
+        .get("from")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'from' argument"))?;
 
-    let to = args.get("to")
+    let to = args
+        .get("to")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing 'to' argument"))?;
 
-    let max_depth = args.get("max_depth").and_then(|v| v.as_f64()).unwrap_or(10.0) as i32;
+    let max_depth = args
+        .get("max_depth")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10.0) as i32;
 
     let conn = rusqlite::Connection::open(&state.db_path)?;
     let path = graph::expand::shortest_path(&conn, from, to, max_depth)?;
 
     match path {
         Some(nodes) => Ok(format!("🛤️  '{}' → '{}': {}", from, to, nodes.join(" → "))),
-        None => Ok(format!("⚠️  No se encontró camino entre '{}' y '{}'", from, to)),
+        None => Ok(format!(
+            "⚠️  No se encontró camino entre '{}' y '{}'",
+            from, to
+        )),
     }
 }
 
@@ -474,15 +569,22 @@ fn handle_resource_stats(db_path: &str) -> Result<String> {
         "nodes": stats.nodes,
         "edges": stats.edges,
         "types": format!("{}", stats)
-    }).to_string())
+    })
+    .to_string())
 }
 
 fn handle_resource_nodes(db_path: &str, filter_type: Option<&str>) -> Result<String> {
     let conn = rusqlite::Connection::open(db_path)?;
 
     let (sql, label) = match filter_type {
-        Some(t) => (format!("SELECT id, label, type, metadata FROM nodes WHERE type = ?1"), t.to_string()),
-        None => ("SELECT id, label, type, metadata FROM nodes".to_string(), "all".to_string()),
+        Some(t) => (
+            format!("SELECT id, label, type, metadata FROM nodes WHERE type = ?1"),
+            t.to_string(),
+        ),
+        None => (
+            "SELECT id, label, type, metadata FROM nodes".to_string(),
+            "all".to_string(),
+        ),
     };
 
     let mut stmt = conn.prepare(&sql)?;
@@ -493,7 +595,9 @@ fn handle_resource_nodes(db_path: &str, filter_type: Option<&str>) -> Result<Str
             let type_: String = row.get(2)?;
             let meta: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
             Ok(json!({"id": id, "label": label, "type": type_, "metadata": meta}))
-        })?.filter_map(|r| r.ok()).collect()
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
     } else {
         stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
@@ -501,7 +605,9 @@ fn handle_resource_nodes(db_path: &str, filter_type: Option<&str>) -> Result<Str
             let type_: String = row.get(2)?;
             let meta: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
             Ok(json!({"id": id, "label": label, "type": type_, "metadata": meta}))
-        })?.filter_map(|r| r.ok()).collect()
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
     };
 
     Ok(json!({"nodes": rows, "total": rows.len()}).to_string())
@@ -509,20 +615,20 @@ fn handle_resource_nodes(db_path: &str, filter_type: Option<&str>) -> Result<Str
 
 fn handle_resource_node_by_label(db_path: &str, label: &str) -> Result<String> {
     let conn = rusqlite::Connection::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT id, label, type, metadata FROM nodes WHERE label = ?1 OR id = ?2")?;
+    let mut stmt =
+        conn.prepare("SELECT id, label, type, metadata FROM nodes WHERE label = ?1 OR id = ?2")?;
 
     let id_parse = label.parse::<i64>().unwrap_or(-1);
 
-    let node: Option<Value> = stmt.query_row(
-        rusqlite::params![label, id_parse],
-        |row| {
+    let node: Option<Value> = stmt
+        .query_row(rusqlite::params![label, id_parse], |row| {
             let id: i64 = row.get(0)?;
             let label: String = row.get(1)?;
             let type_: String = row.get(2)?;
             let meta: String = row.get::<_, Option<String>>(3)?.unwrap_or_default();
             Ok(json!({"id": id, "label": label, "type": type_, "metadata": meta}))
-        }
-    ).ok();
+        })
+        .ok();
 
     match node {
         Some(n) => Ok(json!({"node": n}).to_string()),
@@ -538,21 +644,24 @@ fn handle_resource_edges(db_path: &str, _type_filter: Option<&str>) -> Result<St
          FROM edges e
          JOIN nodes s ON e.source_id = s.id
          JOIN nodes t ON e.target_id = t.id
-         LIMIT 500"
+         LIMIT 500",
     )?;
 
-    let rows: Vec<Value> = stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        let _src_id: i64 = row.get(1)?;
-        let _tgt_id: i64 = row.get(2)?;
-        let type_: String = row.get(3)?;
-        let weight: f64 = row.get(4)?;
-        let ctx: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
-        let src_lbl: String = row.get(6)?;
-        let tgt_lbl: String = row.get(7)?;
-        Ok(json!({"id": id, "source": src_lbl, "target": tgt_lbl,
+    let rows: Vec<Value> = stmt
+        .query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let _src_id: i64 = row.get(1)?;
+            let _tgt_id: i64 = row.get(2)?;
+            let type_: String = row.get(3)?;
+            let weight: f64 = row.get(4)?;
+            let ctx: String = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            let src_lbl: String = row.get(6)?;
+            let tgt_lbl: String = row.get(7)?;
+            Ok(json!({"id": id, "source": src_lbl, "target": tgt_lbl,
                    "type": type_, "weight": weight, "context": ctx}))
-    })?.filter_map(|r| r.ok()).collect();
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
 
     Ok(json!({"edges": rows, "total": rows.len()}).to_string())
 }
@@ -567,7 +676,12 @@ fn dispatch(req: JsonRpcRequest, state: &McpState) -> JsonRpcResponse {
         "initialize" => handle_initialize(&req),
         "notifications/initialized" | "notifications/cancelled" => {
             // Notificaciones sin respuesta
-            JsonRpcResponse { jsonrpc: "2.0".into(), result: None, error: None, id: None }
+            JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                result: None,
+                error: None,
+                id: None,
+            }
         }
         "shutdown" => {
             // Señal de apagado — el bucle principal lo maneja
@@ -589,7 +703,12 @@ fn dispatch(req: JsonRpcRequest, state: &McpState) -> JsonRpcResponse {
 ///
 /// Lee líneas JSON-RPC de stdin, las procesa y escribe la respuesta en stdout.
 /// El servidor se ejecuta hasta recibir EOF en stdin.
-pub fn run_server(db_path: &str, ollama_url: &str, embed_model: &str, num_threads: usize) -> Result<()> {
+pub fn run_server(
+    db_path: &str,
+    ollama_url: &str,
+    embed_model: &str,
+    num_threads: usize,
+) -> Result<()> {
     let state = McpState {
         db_path: db_path.to_string(),
         ollama_url: ollama_url.to_string(),

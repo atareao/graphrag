@@ -7,9 +7,9 @@
 //! [`crate::vector::synthetic`].
 
 use anyhow::{Context, Result};
+use log::debug;
 use rusqlite::Connection;
 use serde_json::json;
-use log::debug;
 
 use crate::db::schema;
 use crate::vector::{self, synthetic};
@@ -77,30 +77,126 @@ pub fn create_demo_db(path: &str) -> Result<()> {
     // ENTITIES (24)
     // =====================================================================
     let entidades = vec![
-        Entidad { label: "Docker".into(), r#type: "tool".into(), description: "Plataforma de contenedores".into() },
-        Entidad { label: "Podman".into(), r#type: "tool".into(), description: "Alternativa daemonless a Docker".into() },
-        Entidad { label: "Traefik".into(), r#type: "tool".into(), description: "Reverse proxy y load balancer".into() },
-        Entidad { label: "Python".into(), r#type: "language".into(), description: "Lenguaje de programación".into() },
-        Entidad { label: "Rust".into(), r#type: "language".into(), description: "Lenguaje de sistemas".into() },
-        Entidad { label: "PostgreSQL".into(), r#type: "database".into(), description: "Base de datos relacional".into() },
-        Entidad { label: "SQLite".into(), r#type: "database".into(), description: "Base de datos embebida".into() },
-        Entidad { label: "SQLAlchemy".into(), r#type: "library".into(), description: "ORM para Python".into() },
-        Entidad { label: "pandas".into(), r#type: "library".into(), description: "Análisis de datos en Python".into() },
-        Entidad { label: "FastAPI".into(), r#type: "framework".into(), description: "Framework web para Python".into() },
-        Entidad { label: "nginx".into(), r#type: "tool".into(), description: "Servidor web y proxy".into() },
-        Entidad { label: "Redis".into(), r#type: "database".into(), description: "Base de datos en memoria".into() },
-        Entidad { label: "Linux".into(), r#type: "os".into(), description: "Sistema operativo".into() },
-        Entidad { label: "AppArmor".into(), r#type: "security".into(), description: "Módulo de seguridad Linux".into() },
-        Entidad { label: "Seccomp".into(), r#type: "security".into(), description: "Filtro de syscalls".into() },
-        Entidad { label: "Namespaces".into(), r#type: "concept".into(), description: "Aislamiento de procesos Linux".into() },
-        Entidad { label: "Cgroups".into(), r#type: "concept".into(), description: "Control de recursos Linux".into() },
-        Entidad { label: "Docker Compose".into(), r#type: "tool".into(), description: "Orquestación multi-contenedor".into() },
-        Entidad { label: "Kubernetes".into(), r#type: "tool".into(), description: "Orquestador de contenedores".into() },
-        Entidad { label: "Prometheus".into(), r#type: "tool".into(), description: "Sistema de monitorización".into() },
-        Entidad { label: "Grafana".into(), r#type: "tool".into(), description: "Visualización de métricas".into() },
-        Entidad { label: "LLM".into(), r#type: "concept".into(), description: "Modelos de lenguaje".into() },
-        Entidad { label: "Embeddings".into(), r#type: "concept".into(), description: "Vectores semánticos".into() },
-        Entidad { label: "GraphRAG".into(), r#type: "concept".into(), description: "Búsqueda híbrida con grafos".into() },
+        Entidad {
+            label: "Docker".into(),
+            r#type: "tool".into(),
+            description: "Plataforma de contenedores".into(),
+        },
+        Entidad {
+            label: "Podman".into(),
+            r#type: "tool".into(),
+            description: "Alternativa daemonless a Docker".into(),
+        },
+        Entidad {
+            label: "Traefik".into(),
+            r#type: "tool".into(),
+            description: "Reverse proxy y load balancer".into(),
+        },
+        Entidad {
+            label: "Python".into(),
+            r#type: "language".into(),
+            description: "Lenguaje de programación".into(),
+        },
+        Entidad {
+            label: "Rust".into(),
+            r#type: "language".into(),
+            description: "Lenguaje de sistemas".into(),
+        },
+        Entidad {
+            label: "PostgreSQL".into(),
+            r#type: "database".into(),
+            description: "Base de datos relacional".into(),
+        },
+        Entidad {
+            label: "SQLite".into(),
+            r#type: "database".into(),
+            description: "Base de datos embebida".into(),
+        },
+        Entidad {
+            label: "SQLAlchemy".into(),
+            r#type: "library".into(),
+            description: "ORM para Python".into(),
+        },
+        Entidad {
+            label: "pandas".into(),
+            r#type: "library".into(),
+            description: "Análisis de datos en Python".into(),
+        },
+        Entidad {
+            label: "FastAPI".into(),
+            r#type: "framework".into(),
+            description: "Framework web para Python".into(),
+        },
+        Entidad {
+            label: "nginx".into(),
+            r#type: "tool".into(),
+            description: "Servidor web y proxy".into(),
+        },
+        Entidad {
+            label: "Redis".into(),
+            r#type: "database".into(),
+            description: "Base de datos en memoria".into(),
+        },
+        Entidad {
+            label: "Linux".into(),
+            r#type: "os".into(),
+            description: "Sistema operativo".into(),
+        },
+        Entidad {
+            label: "AppArmor".into(),
+            r#type: "security".into(),
+            description: "Módulo de seguridad Linux".into(),
+        },
+        Entidad {
+            label: "Seccomp".into(),
+            r#type: "security".into(),
+            description: "Filtro de syscalls".into(),
+        },
+        Entidad {
+            label: "Namespaces".into(),
+            r#type: "concept".into(),
+            description: "Aislamiento de procesos Linux".into(),
+        },
+        Entidad {
+            label: "Cgroups".into(),
+            r#type: "concept".into(),
+            description: "Control de recursos Linux".into(),
+        },
+        Entidad {
+            label: "Docker Compose".into(),
+            r#type: "tool".into(),
+            description: "Orquestación multi-contenedor".into(),
+        },
+        Entidad {
+            label: "Kubernetes".into(),
+            r#type: "tool".into(),
+            description: "Orquestador de contenedores".into(),
+        },
+        Entidad {
+            label: "Prometheus".into(),
+            r#type: "tool".into(),
+            description: "Sistema de monitorización".into(),
+        },
+        Entidad {
+            label: "Grafana".into(),
+            r#type: "tool".into(),
+            description: "Visualización de métricas".into(),
+        },
+        Entidad {
+            label: "LLM".into(),
+            r#type: "concept".into(),
+            description: "Modelos de lenguaje".into(),
+        },
+        Entidad {
+            label: "Embeddings".into(),
+            r#type: "concept".into(),
+            description: "Vectores semánticos".into(),
+        },
+        Entidad {
+            label: "GraphRAG".into(),
+            r#type: "concept".into(),
+            description: "Búsqueda híbrida con grafos".into(),
+        },
     ];
 
     for ent in &entidades {
@@ -293,28 +389,48 @@ pub fn create_demo_db(path: &str) -> Result<()> {
     // CO-OCCURRENCE EDGES between entities
     // =====================================================================
     let co_occurrences: Vec<(&str, &str, f64)> = vec![
-        ("Docker", "Namespaces", 0.9), ("Docker", "Cgroups", 0.9),
-        ("Docker", "AppArmor", 0.8), ("Docker", "Seccomp", 0.8),
-        ("Docker", "Linux", 0.7), ("Docker", "Podman", 0.8),
-        ("Docker", "Docker Compose", 0.9), ("Docker", "Kubernetes", 0.7),
-        ("Docker", "Traefik", 0.7), ("Docker", "nginx", 0.5),
-        ("Docker", "Redis", 0.5), ("Docker", "FastAPI", 0.6),
-        ("Python", "FastAPI", 0.9), ("Python", "SQLAlchemy", 0.9),
-        ("Python", "pandas", 0.9), ("Python", "SQLite", 0.7),
-        ("Python", "PostgreSQL", 0.7), ("Python", "Redis", 0.6),
+        ("Docker", "Namespaces", 0.9),
+        ("Docker", "Cgroups", 0.9),
+        ("Docker", "AppArmor", 0.8),
+        ("Docker", "Seccomp", 0.8),
+        ("Docker", "Linux", 0.7),
+        ("Docker", "Podman", 0.8),
+        ("Docker", "Docker Compose", 0.9),
+        ("Docker", "Kubernetes", 0.7),
+        ("Docker", "Traefik", 0.7),
+        ("Docker", "nginx", 0.5),
+        ("Docker", "Redis", 0.5),
+        ("Docker", "FastAPI", 0.6),
+        ("Python", "FastAPI", 0.9),
+        ("Python", "SQLAlchemy", 0.9),
+        ("Python", "pandas", 0.9),
+        ("Python", "SQLite", 0.7),
+        ("Python", "PostgreSQL", 0.7),
+        ("Python", "Redis", 0.6),
         ("Python", "Rust", 0.5),
-        ("PostgreSQL", "SQLite", 0.6), ("PostgreSQL", "SQLAlchemy", 0.8),
-        ("SQLite", "SQLAlchemy", 0.7), ("SQLite", "pandas", 0.5),
-        ("FastAPI", "Traefik", 0.7), ("FastAPI", "Docker", 0.6),
-        ("Traefik", "Kubernetes", 0.6), ("Traefik", "Prometheus", 0.5),
-        ("Kubernetes", "Prometheus", 0.8), ("Kubernetes", "Grafana", 0.7),
+        ("PostgreSQL", "SQLite", 0.6),
+        ("PostgreSQL", "SQLAlchemy", 0.8),
+        ("SQLite", "SQLAlchemy", 0.7),
+        ("SQLite", "pandas", 0.5),
+        ("FastAPI", "Traefik", 0.7),
+        ("FastAPI", "Docker", 0.6),
+        ("Traefik", "Kubernetes", 0.6),
+        ("Traefik", "Prometheus", 0.5),
+        ("Kubernetes", "Prometheus", 0.8),
+        ("Kubernetes", "Grafana", 0.7),
         ("Prometheus", "Grafana", 0.9),
-        ("AppArmor", "Seccomp", 0.8), ("AppArmor", "Linux", 0.7),
-        ("Seccomp", "Linux", 0.7), ("Namespaces", "Cgroups", 0.8),
-        ("Namespaces", "Linux", 0.7), ("Cgroups", "Linux", 0.7),
-        ("LLM", "Embeddings", 0.9), ("LLM", "GraphRAG", 0.8),
-        ("Embeddings", "GraphRAG", 0.9), ("GraphRAG", "SQLite", 0.7),
-        ("Docker", "Embeddings", 0.3), ("Podman", "Namespaces", 0.7),
+        ("AppArmor", "Seccomp", 0.8),
+        ("AppArmor", "Linux", 0.7),
+        ("Seccomp", "Linux", 0.7),
+        ("Namespaces", "Cgroups", 0.8),
+        ("Namespaces", "Linux", 0.7),
+        ("Cgroups", "Linux", 0.7),
+        ("LLM", "Embeddings", 0.9),
+        ("LLM", "GraphRAG", 0.8),
+        ("Embeddings", "GraphRAG", 0.9),
+        ("GraphRAG", "SQLite", 0.7),
+        ("Docker", "Embeddings", 0.3),
+        ("Podman", "Namespaces", 0.7),
         ("nginx", "Traefik", 0.4),
     ];
 
@@ -341,7 +457,10 @@ pub fn create_demo_db(path: &str) -> Result<()> {
             rusqlite::params![src_id, dst_id, weight],
         )?;
     }
-    debug!("Aristas co_occurs_with insertadas: {}", co_occurrences.len());
+    debug!(
+        "Aristas co_occurs_with insertadas: {}",
+        co_occurrences.len()
+    );
 
     // ── Repoblar FTS5 (sin triggers) ────────────────────────────────────
     // Insertar todos los nodos con contenido no vacío.
@@ -350,7 +469,7 @@ pub fn create_demo_db(path: &str) -> Result<()> {
          INSERT INTO notes_fts(rowid, title, content)
          SELECT id, label, COALESCE(json_extract(metadata, '$.content'), '')
          FROM nodes
-         WHERE COALESCE(json_extract(metadata, '$.content'), '') != '';"
+         WHERE COALESCE(json_extract(metadata, '$.content'), '') != '';",
     )?;
 
     // Commit the transaction.
@@ -401,10 +520,7 @@ mod tests {
             .unwrap();
         // 1 bootstrap edge + ~20*avg_entities mentioned_in + 42 co_occurrences
         // Exact count depends on the data above, but assert a reasonable range.
-        assert!(
-            edges >= 80,
-            "expected at least 80 edges, got {edges}"
-        );
+        assert!(edges >= 80, "expected at least 80 edges, got {edges}");
     }
 
     /// Every note should have a non-null embedding.
@@ -475,11 +591,12 @@ mod tests {
         create_demo_db(path).unwrap();
 
         let conn = Connection::open(path).unwrap();
-        let mut stmt = conn
-            .prepare("SELECT COUNT(*) FROM notes_fts")
-            .unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM notes_fts").unwrap();
         let count: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
         // 20 notas con 'content' en metadata → 20 filas en FTS.
-        assert_eq!(count, 20, "expected 20 rows in notes_fts (one per note), got {count}");
+        assert_eq!(
+            count, 20,
+            "expected 20 rows in notes_fts (one per note), got {count}"
+        );
     }
 }

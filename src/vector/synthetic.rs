@@ -1,6 +1,6 @@
+use log::debug;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use log::debug;
 
 use crate::vector;
 
@@ -35,7 +35,10 @@ pub fn synthetic_embedding(text: &str, dims: usize) -> Vec<f32> {
     }
 
     let preview: String = text.chars().take(40).collect();
-    debug!("synthetic_embedding: text='{}'... → {}d, seed={}", preview, dims, seed);
+    debug!(
+        "synthetic_embedding: text='{}'... → {}d, seed={}",
+        preview, dims, seed
+    );
     vector::normalize(&vec)
 }
 

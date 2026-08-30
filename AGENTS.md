@@ -35,6 +35,7 @@ cargo build --release
 | `-d` | search, graph | 2 | Graph expansion depth |
 | `-a` | search | 0.7 | Vector weight (0.0=pure graph, 1.0=pure vector) |
 | `--vector-only` | search | false | Skip graph expansion entirely |
+| `--notes-only` | search | false | Show only notes (no entities/tags) |
 | `--min-weight` | search | none | Filter edges by minimum weight |
 | `--ollama` | search | false | Use Ollama for embeddings (default: synthetic) |
 | `--ollama-url` | build, search, mcp | `http://localhost:11434` | |
@@ -71,6 +72,7 @@ src/
 - **FTS5 is repopulated from scratch** after every `build` (no triggers). This avoids a SQLite 3.x bug where FTS5 `'delete'` fails with empty content.
 - **Build is incremental.** Each note stores a SHA256 hash in metadata. Only new/modified files are reprocessed. Deleted files are pruned automatically.
 - **Build uses `unchecked_transaction`** per file (not nested). Each file gets its own transaction.
+- **Build computes synthetic embeddings** for every node (notes, entities, tags) using deterministic hash-based embeddings. No Ollama needed for search after build.
 - **Build is parallel.** N worker threads do NER in parallel, sending results through a channel to a single writer thread (avoids SQLite lock contention). Number of threads configurable via `num_threads` in config.
 - **NER batch mode.** All chunks of a file are sent in a single Ollama call with `---SECTION N---` markers. The model returns entities with a `section` field.
 - **NER retry with backoff.** On connection error, retries 3 times (2s, 4s, 8s). If all fail, the file is skipped entirely (not inserted without entities).

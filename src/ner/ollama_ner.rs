@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use log::debug;
+use serde::{Deserialize, Serialize};
 
 use crate::chunking::slugify;
 
@@ -56,16 +56,23 @@ fn call_ollama(ollama_url: &str, model: &str, prompt: &str) -> Result<String> {
 
     let resp_text = resp.text().context("Failed to read response body")?;
     let preview: String = resp_text.chars().take(200).collect();
-    debug!("NER respuesta cruda ({} chars): {}", resp_text.len(), preview);
+    debug!(
+        "NER respuesta cruda ({} chars): {}",
+        resp_text.len(),
+        preview
+    );
 
-    let data: OllamaResponse = serde_json::from_str(&resp_text)
-        .context("Failed to parse Ollama response JSON")?;
+    let data: OllamaResponse =
+        serde_json::from_str(&resp_text).context("Failed to parse Ollama response JSON")?;
 
     // Algunos modelos (como qwen3.5) ponen la respuesta en 'thinking' en lugar de 'response'
     let raw = if !data.response.trim().is_empty() {
         data.response
     } else if !data.thinking.trim().is_empty() {
-        debug!("NER: response vacío, usando campo 'thinking' ({} chars)", data.thinking.len());
+        debug!(
+            "NER: response vacío, usando campo 'thinking' ({} chars)",
+            data.thinking.len()
+        );
         data.thinking
     } else {
         debug!("NER respuesta vacía para modelo '{}'.", model);
@@ -228,7 +235,11 @@ Text:
     let entities = raw_entities_to_entities(raw_entities);
 
     let preview: String = text.chars().take(40).collect();
-    debug!("NER extraídas: {} entidades de '{}'...", entities.len(), preview);
+    debug!(
+        "NER extraídas: {} entidades de '{}'...",
+        entities.len(),
+        preview
+    );
     Ok(entities)
 }
 
@@ -362,7 +373,12 @@ mod tests {
 
     #[test]
     fn test_whitespace_text_returns_empty() {
-        let result = extract_entities("http://localhost:11434", "llama3", "   \n  ", DEFAULT_LABELS);
+        let result = extract_entities(
+            "http://localhost:11434",
+            "llama3",
+            "   \n  ",
+            DEFAULT_LABELS,
+        );
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
