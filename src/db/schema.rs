@@ -287,10 +287,7 @@ mod tests {
         // Update the node's label and content.
         conn.execute(
             "UPDATE nodes SET label = ?1, metadata = ?2 WHERE label = 'test-note'",
-            rusqlite::params![
-                "updated-note",
-                r#"{"content":"updated content"}"#,
-            ],
+            rusqlite::params!["updated-note", r#"{"content":"updated content"}"#,],
         )
         .unwrap();
 
@@ -336,8 +333,7 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert!(
-            journal.to_uppercase() == "WAL"
-                || journal.to_uppercase() == "MEMORY",
+            journal.to_uppercase() == "WAL" || journal.to_uppercase() == "MEMORY",
             "unexpected journal mode: {}",
             journal
         );

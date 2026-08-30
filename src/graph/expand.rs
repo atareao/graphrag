@@ -1,7 +1,7 @@
 use anyhow::Result;
+use log::debug;
 use rusqlite::Connection;
 use serde::Serialize;
-use log::debug;
 
 /// Un vecino encontrado durante la expansión del grafo
 #[derive(Debug, Clone, Serialize)]
@@ -17,11 +17,7 @@ pub struct Neighbor {
 /// La CTE empieza con los vecinos directos del nodo (nivel 0)
 /// y va expandiendo nivel a nivel hasta la profundidad indicada.
 /// Recorre aristas en ambas direcciones (source → target y target → source).
-pub fn expand_neighbors(
-    conn: &Connection,
-    node_id: i64,
-    depth: i32,
-) -> Result<Vec<Neighbor>> {
+pub fn expand_neighbors(conn: &Connection, node_id: i64, depth: i32) -> Result<Vec<Neighbor>> {
     if depth <= 0 {
         return Ok(Vec::new());
     }
@@ -70,7 +66,12 @@ pub fn expand_neighbors(
     for row in rows {
         neighbors.push(row?);
     }
-    debug!("expand_neighbors: node_id={}, depth={} → {} vecinos", node_id, depth, neighbors.len());
+    debug!(
+        "expand_neighbors: node_id={}, depth={} → {} vecinos",
+        node_id,
+        depth,
+        neighbors.len()
+    );
 
     Ok(neighbors)
 }
@@ -130,8 +131,13 @@ pub fn expand_neighbors_weighted(
     for row in rows {
         neighbors.push(row?);
     }
-    debug!("expand_neighbors_weighted: node_id={}, depth={}, min_weight={} → {} vecinos",
-           node_id, depth, min_weight, neighbors.len());
+    debug!(
+        "expand_neighbors_weighted: node_id={}, depth={}, min_weight={} → {} vecinos",
+        node_id,
+        depth,
+        min_weight,
+        neighbors.len()
+    );
 
     Ok(neighbors)
 }
@@ -177,24 +183,27 @@ pub fn shortest_path(
         "#,
     )?;
 
-    let result = stmt.query_row(
-        rusqlite::params![from_label, to_label, max_depth],
-        |row| {
-            let route: String = row.get(0)?;
-            Ok(route)
-        },
-    );
+    let result = stmt.query_row(rusqlite::params![from_label, to_label, max_depth], |row| {
+        let route: String = row.get(0)?;
+        Ok(route)
+    });
 
     match result {
         Ok(route) => {
             let nodes: Vec<String> = route.split(" --> ").map(|s| s.to_string()).collect();
-            debug!("shortest_path: '{}' → '{}' encontrado: {} pasos",
-                   from_label, to_label, nodes.len());
+            debug!(
+                "shortest_path: '{}' → '{}' encontrado: {} pasos",
+                from_label,
+                to_label,
+                nodes.len()
+            );
             Ok(Some(nodes))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => {
-            debug!("shortest_path: '{}' → '{}' no encontrado (max_depth={})",
-                   from_label, to_label, max_depth);
+            debug!(
+                "shortest_path: '{}' → '{}' no encontrado (max_depth={})",
+                from_label, to_label, max_depth
+            );
             Ok(None)
         }
         Err(e) => Err(e.into()),
@@ -209,7 +218,7 @@ mod tests {
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_db(&conn).unwrap();
-        
+
         // Insert test nodes
         conn.execute_batch(
             "INSERT INTO nodes (id, label, type) VALUES (1, 'Python', 'language');
@@ -219,9 +228,10 @@ mod tests {
              INSERT INTO edges (source_id, target_id, type, weight) VALUES (1, 3, 'uses', 0.9);
              INSERT INTO edges (source_id, target_id, type, weight) VALUES (3, 2, 'connects', 0.8);
              INSERT INTO edges (source_id, target_id, type, weight) VALUES (1, 4, 'runs_in', 0.7);
-            "
-        ).unwrap();
-        
+            ",
+        )
+        .unwrap();
+
         conn
     }
 

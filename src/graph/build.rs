@@ -1,18 +1,22 @@
-use std::path::Path;
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::mpsc;
-use std::time::Duration;
-use sha2::{Sha256, Digest};
-use anyhow::{Result, Context};
-use rusqlite::Connection;
-use walkdir::WalkDir;
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use log::{info, debug};
+use log::{debug, info};
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::mpsc;
+use std::sync::Mutex;
+use std::time::Duration;
+use walkdir::WalkDir;
 
 use crate::chunking::{chunk_document, parse_frontmatter, slugify};
-use crate::ner::{extract_entities_batch, Entity, DEFAULT_LABELS};
 use crate::db::schema;
+use crate::ner::{extract_entities_batch, Entity, DEFAULT_LABELS};
+use crate::vector;
+
+/// Dimensión de los embeddings sintéticos
+const EMBED_DIMS: usize = 1024;
 
 /// Estadísticas de la construcción del grafo
 #[derive(Debug, Default, Clone)]
@@ -103,9 +107,7 @@ pub fn build_graph(
     // Mapa: ruta_relativa → (hash, id_del_nodo)
     let mut existing: HashMap<String, (String, i64)> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT id, label, metadata FROM nodes WHERE type = 'note'"
-        )?;
+        let mut stmt = conn.prepare("SELECT id, label, metadata FROM nodes WHERE type = 'note'")?;
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let label: String = row.get(1)?;
@@ -133,7 +135,7 @@ pub fn build_graph(
     spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     spinner.set_message("🔍 Escaneando archivos .md...");
 
@@ -181,7 +183,10 @@ pub fn build_graph(
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         let result = hasher.finalize();
-        let file_hash = result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let file_hash = result
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
 
         if let Some((stored_hash, _)) = existing.get(&relative_str) {
             if *stored_hash == file_hash {
@@ -195,7 +200,10 @@ pub fn build_graph(
     }
 
     let total_to_process = to_process.len();
-    info!("Archivos a procesar (nuevos/modificados): {}", total_to_process);
+    info!(
+        "Archivos a procesar (nuevos/modificados): {}",
+        total_to_process
+    );
 
     // Ajustar la barra de progreso al número real de archivos a procesar
     pb.lock().unwrap().set_length(total_to_process as u64);
@@ -208,7 +216,10 @@ pub fn build_graph(
     // Determinar número de hilos (de la configuración, con límite sensato)
     let num_threads = num_threads.max(1).min(16);
 
-    info!("Procesando con {} hilos en paralelo (NER) + 1 escritor", num_threads);
+    info!(
+        "Procesando con {} hilos en paralelo (NER) + 1 escritor",
+        num_threads
+    );
 
     let chunk_size = (total_to_process + num_threads - 1) / num_threads;
     let chunks: Vec<&[&Path]> = to_process.chunks(chunk_size.max(1)).collect();
@@ -287,14 +298,16 @@ pub fn build_graph(
                     );
                 }
 
-                // Insertar/actualizar nodo nota
+                // Insertar/actualizar nodo nota con embedding sintético
+                let note_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(&note_title, EMBED_DIMS));
                 if let Err(e) = tx.execute(
-                    "INSERT INTO nodes (label, type, metadata)
-                     VALUES (?1, 'note', ?2)
+                    "INSERT INTO nodes (label, type, metadata, embedding)
+                     VALUES (?1, 'note', ?2, ?3)
                      ON CONFLICT(label) DO UPDATE SET
                        type = excluded.type,
-                       metadata = excluded.metadata",
-                    rusqlite::params![note_title, note_metadata],
+                       metadata = excluded.metadata,
+                       embedding = excluded.embedding",
+                    rusqlite::params![note_title, note_metadata, note_emb],
                 ) {
                     log::warn!("⚠️  Error insertando nodo nota '{}': {}", note_title, e);
                     pb.lock().unwrap().inc(1);
@@ -339,12 +352,14 @@ pub fn build_graph(
                             "source": ner_model,
                         });
 
+                        let ent_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(&ent.label, EMBED_DIMS));
                         let _ = tx.execute(
-                            "INSERT INTO nodes (label, type, metadata)
-                             VALUES (?1, ?2, ?3)
+                            "INSERT INTO nodes (label, type, metadata, embedding)
+                             VALUES (?1, ?2, ?3, ?4)
                              ON CONFLICT(label) DO UPDATE SET
-                               metadata = excluded.metadata",
-                            rusqlite::params![ent.label, ent.type_, ent_metadata.to_string()],
+                               metadata = excluded.metadata,
+                               embedding = excluded.embedding",
+                            rusqlite::params![ent.label, ent.type_, ent_metadata.to_string(), ent_emb],
                         );
 
                         if let Ok(ent_node_id) = tx.query_row::<i64, _, _>(
@@ -384,9 +399,10 @@ pub fn build_graph(
 
                 // Relaciones estructurales: directorio
                 if !parent_dir.is_empty() && !skip_dirs.contains(&parent_dir.as_str()) {
+                    let dir_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(&parent_dir, EMBED_DIMS));
                     let _ = tx.execute(
-                        "INSERT OR IGNORE INTO nodes (label, type) VALUES (?1, 'tag')",
-                        rusqlite::params![parent_dir],
+                        "INSERT INTO nodes (label, type, embedding) VALUES (?1, 'tag', ?2) ON CONFLICT(label) DO UPDATE SET embedding = excluded.embedding",
+                        rusqlite::params![parent_dir, dir_emb],
                     );
                     if let Ok(dir_id) = tx.query_row::<i64, _, _>(
                         "SELECT id FROM nodes WHERE label = ?1",
@@ -403,9 +419,10 @@ pub fn build_graph(
 
                 // Relaciones estructurales: tags
                 for tag in &tags {
+                    let tag_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(tag, EMBED_DIMS));
                     let _ = tx.execute(
-                        "INSERT OR IGNORE INTO nodes (label, type) VALUES (?1, 'tag')",
-                        rusqlite::params![tag],
+                        "INSERT INTO nodes (label, type, embedding) VALUES (?1, 'tag', ?2) ON CONFLICT(label) DO UPDATE SET embedding = excluded.embedding",
+                        rusqlite::params![tag, tag_emb],
                     );
                     if let Ok(tag_id) = tx.query_row::<i64, _, _>(
                         "SELECT id FROM nodes WHERE label = ?1",
@@ -463,10 +480,17 @@ pub fn build_graph(
                     let mut hasher = Sha256::new();
                     hasher.update(text.as_bytes());
                     let result = hasher.finalize();
-                    let file_hash = result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+                    let file_hash = result
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>();
 
                     let (metadata, body) = parse_frontmatter(&text);
-                    debug!("Procesando archivo: {} (hash={})", relative_str, &file_hash[..8]);
+                    debug!(
+                        "Procesando archivo: {} (hash={})",
+                        relative_str,
+                        &file_hash[..8]
+                    );
 
                     let note_stem = md_path.file_stem().unwrap().to_string_lossy();
                     if note_stem.is_empty() {
@@ -500,7 +524,10 @@ pub fn build_graph(
                         let mut result = None;
                         for attempt in 1..=3 {
                             match extract_entities_batch(
-                                ollama_url, ner_model, &chunk_texts, labels,
+                                ollama_url,
+                                ner_model,
+                                &chunk_texts,
+                                labels,
                             ) {
                                 Ok(ents) => {
                                     result = Some(ents);
@@ -509,7 +536,9 @@ pub fn build_graph(
                                 Err(e) => {
                                     log::warn!(
                                         "⚠️  Error en NER batch para {} (intento {}/3): {}",
-                                        relative_str, attempt, e
+                                        relative_str,
+                                        attempt,
+                                        e
                                     );
                                     if attempt < 3 {
                                         let delay = Duration::from_secs(2u64.pow(attempt));
@@ -534,7 +563,12 @@ pub fn build_graph(
                     // Tags del frontmatter
                     let tags: Vec<String> = metadata
                         .get("tags")
-                        .map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+                        .map(|t| {
+                            t.split(',')
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect()
+                        })
                         .unwrap_or_default();
 
                     // Directorio padre
@@ -574,14 +608,12 @@ pub fn build_graph(
     prune_spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.red} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     prune_spinner.set_message("🧹 Limpiando notas eliminadas...");
 
     let ids_to_prune: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, metadata FROM nodes WHERE type = 'note'"
-        )?;
+        let mut stmt = conn.prepare("SELECT id, metadata FROM nodes WHERE type = 'note'")?;
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let meta_str: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
@@ -592,7 +624,8 @@ pub fn build_graph(
         for row in rows {
             let (id, meta_str) = row?;
             if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                let should_keep = meta.get("path")
+                let should_keep = meta
+                    .get("path")
                     .and_then(|p| p.as_str())
                     .map(|p| {
                         let full_path = repo.join(p);
@@ -601,7 +634,11 @@ pub fn build_graph(
                     .unwrap_or(false);
 
                 if !should_keep {
-                    let note_label = meta.get("slug").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+                    let note_label = meta
+                        .get("slug")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
                     to_remove.push((id, note_label));
                 }
             }
@@ -612,14 +649,20 @@ pub fn build_graph(
     let pruned = ids_to_prune.len();
     if pruned > 0 {
         for (id, label) in &ids_to_prune {
-            conn.execute("DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1", rusqlite::params![id])
-                .with_context(|| format!("Error deleting edges for pruned note id={}", id))?;
+            conn.execute(
+                "DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1",
+                rusqlite::params![id],
+            )
+            .with_context(|| format!("Error deleting edges for pruned note id={}", id))?;
             conn.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
                 .with_context(|| format!("Error deleting node id={} label={}", id, label))?;
             info!("Nota eliminada (archivo no encontrado): {}", label);
         }
         info!("Notas eliminadas del grafo: {}", pruned);
-        debug!("Limpieza completada: {} notas eliminadas del disco.", pruned);
+        debug!(
+            "Limpieza completada: {} notas eliminadas del disco.",
+            pruned
+        );
     }
     prune_spinner.finish_with_message(format!("✅ {} notas eliminadas del disco", pruned));
 
@@ -637,7 +680,7 @@ pub fn build_graph(
     fts_spinner.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.blue} {msg}")
-            .unwrap()
+            .unwrap(),
     );
     fts_spinner.set_message("📑 Repoblando índice FTS5...");
 
@@ -646,7 +689,7 @@ pub fn build_graph(
          INSERT INTO notes_fts(rowid, title, content)
          SELECT id, label, COALESCE(json_extract(metadata, '$.content'), '')
          FROM nodes
-         WHERE COALESCE(json_extract(metadata, '$.content'), '') != '';"
+         WHERE COALESCE(json_extract(metadata, '$.content'), '') != '';",
     )?;
 
     fts_spinner.finish_with_message("✅ Índice FTS5 repoblado");
@@ -665,8 +708,8 @@ pub fn build_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::fs;
+    use tempfile::NamedTempFile;
 
     /// Crea un directorio temporal con algunos archivos .md para pruebas
     /// de integración.
@@ -709,7 +752,11 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("No se encontraron archivos .md"), "error: {}", err);
+        assert!(
+            err.contains("No se encontraron archivos .md"),
+            "error: {}",
+            err
+        );
     }
 
     #[test]

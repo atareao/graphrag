@@ -112,7 +112,11 @@ num_threads = 4
                 cfg
             }
             Err(e) => {
-                log::debug!("No se pudo cargar configuración desde {}: {}", path.display(), e);
+                log::debug!(
+                    "No se pudo cargar configuración desde {}: {}",
+                    path.display(),
+                    e
+                );
                 Self::default()
             }
         }

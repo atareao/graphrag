@@ -1,6 +1,6 @@
-use anyhow::{Context, Result, anyhow};
-use serde::Deserialize;
+use anyhow::{anyhow, Context, Result};
 use log::debug;
+use serde::Deserialize;
 
 /// Cliente HTTP para el API de embeddings de Ollama
 pub struct OllamaClient {
@@ -46,11 +46,14 @@ impl OllamaClient {
             .error_for_status()
             .context(format!("Ollama API error for model '{}'", self.model))?;
 
-        let data: EmbeddingResponse =
-            resp.json().context("Failed to parse embedding response")?;
+        let data: EmbeddingResponse = resp.json().context("Failed to parse embedding response")?;
         let preview: String = text.chars().take(40).collect();
-        debug!("Ollama embed: model={}, text='{}'... → {} dims",
-               self.model, preview, data.embedding.len());
+        debug!(
+            "Ollama embed: model={}, text='{}'... → {} dims",
+            self.model,
+            preview,
+            data.embedding.len()
+        );
 
         if data.embedding.is_empty() {
             return Err(anyhow!("Ollama returned empty embedding for: {}", text));
@@ -83,8 +86,11 @@ impl OllamaClient {
         }
 
         let models: ModelList = resp.json().context("Failed to parse model list")?;
-        debug!("Ollama modelos disponibles: {} encontrados. Buscando '{}'...",
-               models.models.len(), self.model);
+        debug!(
+            "Ollama modelos disponibles: {} encontrados. Buscando '{}'...",
+            models.models.len(),
+            self.model
+        );
         let model_found = models
             .models
             .iter()

@@ -205,6 +205,7 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `-d` | 2 | Graph expansion depth |
 | `-a` | 0.7 | Vector weight (0.0 = pure graph, 1.0 = pure vectors) |
 | `--vector-only` | — | Vector-only search, skip graph |
+| `--notes-only` | — | Show only notes (no entities/tags) |
 | `--min-weight` | — | Minimum edge weight for expansion |
 | `--ollama` | — | Use Ollama for embeddings (default: synthetic) |
 
