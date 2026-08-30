@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ""
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            ext: ""
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Prepare archive
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/graphrag${{ matrix.ext }}"
+          ARCHIVE_NAME="graphrag${{ matrix.ext }}"
+          cp "$BIN" "$ARCHIVE_NAME"
+          PKG="graphrag-${{ matrix.target }}"
+          tar czf "$PKG.tar.gz" "$ARCHIVE_NAME"
+          echo "ARTIFACT=$PKG.tar.gz" >> $GITHUB_ENV
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphrag-${{ matrix.target }}
+          path: ${{ env.ARTIFACT }}
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: graphrag-*
+          merge-multiple: true
+      - name: Generate release body
+        run: |
+          cat > notes.md <<'EOF'
+          ## graphrag
+
+          ### Downloads
+
+          | Architecture | File |
+          |---|---|
+          EOF
+          for f in *.*; do
+            [[ "$f" == *.md ]] && continue
+            [[ "$f" == *.txt ]] && continue
+            [ -f "$f" ] || continue
+            arch=$(echo "$f" | sed 's/^graphrag-//; s/\.tar\.gz$//; s/\.zip$//')
+            echo "| \`$arch\` | \`$f\` |" >> notes.md
+          done
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: graphrag ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            *.tar.gz
+          generate_release_notes: true
+
+  publish:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
