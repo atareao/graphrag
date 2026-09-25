@@ -121,6 +121,20 @@ Todos los campos son opcionales. Las flags de CLI sobrescriben los valores de co
 graphrag <COMANDO> [ARGUMENTOS]
 ```
 
+### Comandos principales
+
+| Comando | Descripción |
+|---------|-------------|
+| [`build`](#graphrag-build-repo-db) | 📥 Escanear archivos `.md` → extraer entidades → construir grafo |
+| [`search`](#graphrag-search-consulta-db) | 🔍 Búsqueda híbrida (vectores + grafo) |
+| [`fts`](#graphrag-fts-consulta-db) | 📄 Búsqueda exacta FTS5 |
+| [`graph`](#graphrag-graph-etiqueta-db) | 🕸️ Mostrar vecinos de un nodo |
+| [`map`](#graphrag-map-db) | 🖥️ Mapa conceptual interactivo TUI |
+| [`path`](#graphrag-path-desde-hasta-db) | 🔗 Camino más corto entre dos nodos |
+| [`seed`](#graphrag-seed-db) | 🌱 Poblar datos de demo |
+| [`stats`](#graphrag-stats-db) | 📊 Estadísticas del grafo |
+| [`reset`](#graphrag-reset-db) | 🗑️ Eliminar BD y recrear vacía |
+
 ### `graphrag init db [DB]`
 
 Crea una base de datos SQLite vacía con el esquema de GraphRAG.
@@ -261,6 +275,34 @@ Muestra los vecinos de un nodo en el grafo.
 graphrag graph "Docker" graph.db -d 2
 ```
 
+### `graphrag map [DB]`
+
+Mapa conceptual interactivo TUI — explora visualmente el grafo de conocimiento en la terminal.
+
+```bash
+# Grafo completo
+graphrag map graph.db
+
+# Subgrafo centrado en un nodo
+graphrag map --from Python --depth 3 graph.db
+```
+
+| Flag | Por defecto | Descripción |
+|------|-------------|-------------|
+| `--from` | — | Nodo central (omitir para grafo completo) |
+| `-d` | 2 | Profundidad de expansión desde el nodo central |
+
+**Controles:**
+
+| Tecla | Acción |
+|-------|--------|
+| `↑↓←→` / `hjkl` | Navegar entre nodos |
+| `Enter` | Seleccionar nodo (detalles en panel derecho) |
+| `t` | Ciclar filtro: todo → notas → entidades → tags |
+| `/` | Buscar nodos por nombre |
+| `q` / `Esc` | Salir |
+| Click mouse | Seleccionar nodo |
+
 ### `graphrag path <DESDE> <HASTA> [DB]`
 
 Camino más corto entre dos nodos.
@@ -372,6 +414,10 @@ lazy.nvim lo carga automáticamente desde `lua/plugins/`.
 │   │   └── mod.rs        ← Blob <-> Vec<f32>
 │   ├── chunking/markdown.rs ← Parseo de frontmatter + chunking
 │   ├── ner/ollama_ner.rs ← Extracción de entidades (modo lote)
+│   ├── map/
+│   │   ├── mod.rs         ← Carga de datos (load_graph, cmd_map)
+│   │   ├── layout.rs      ← Algoritmo de layout force-directed
+│   │   └── tui.rs         ← TUI interactivo (ratatui)
 │   └── seed/demo_data.rs ← Generador de datos de demo
 └── target/release/graphrag  ← Binario único (~6.5 MB)
 ```
@@ -425,7 +471,7 @@ num_threads = 4
 ## Tests
 
 ```bash
-cargo test                    # 91 tests, 12 ignorados (necesitan Ollama)
+cargo test                    # 123 tests, 12 ignorados (necesitan Ollama)
 cargo test -- --ignored       # Tests que dependen de Ollama
 ```
 
