@@ -207,6 +207,7 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--vector-only` | — | Búsqueda solo vectorial, sin grafo |
 | `--notes-only` | — | Mostrar solo notas (sin entidades/tags) |
 | `--min-weight` | — | Peso mínimo de arista para expansión |
+| `--format` | `table` | Formato de salida: `table`, `list` o `json` |
 | `--ollama` | — | Usar Ollama para embeddings (por defecto: synthetic) |
 
 ### `graphrag similar --label <ETIQUETA> --file <RUTA> [DB]`
@@ -234,6 +235,7 @@ $ graphrag similar --file ~/borradores/nueva-idea.md graph.db -k 10 -d 2
 | `--notes-only` | — | Mostrar solo notas (sin entidades/tags) |
 | `--min-weight` | — | Peso mínimo de arista para expansión |
 | `--filter` | — | Filtrar por campo de metadatos (`--filter "category = tutorial"`) |
+| `--format` | `table` | Formato de salida: `table`, `list` o `json` |
 
 Nota: `--label` y `--file` son mutuamente excluyentes. Usa exactamente uno.
 
@@ -244,6 +246,12 @@ Búsqueda exacta de texto con FTS5.
 ```bash
 graphrag fts "Python" graph.db -l 20
 ```
+
+| Flag | Por defecto | Descripción |
+|------|-------------|-------------|
+| `-l` | 10 | Número de resultados |
+| `--notes-only` | — | Mostrar solo notas (sin entidades/tags) |
+| `--format` | `table` | Formato de salida: `table`, `list` o `json` |
 
 ### `graphrag graph <ETIQUETA> [DB]`
 
@@ -1037,6 +1045,7 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--min-weight` | — | Minimum edge weight for graph expansion |
 | `--filter` | — | Filter by metadata (repeatable). Format: `'field op value'` e.g. `--filter 'date >= 2023'` |
 | `--answer` | — | Narrative answer using community context (requires `community detect + summarize`) |
+| `--format` | `table` | Output format: `table`, `list`, or `json` |
 
 ---
 
@@ -1052,6 +1061,7 @@ graphrag fts "Python" graph.db -l 20
 |------|---------|-------------|
 | `-l` | 10 | Number of results |
 | `--notes-only` | — | Show only notes (no entities/tags) |
+| `--format` | `table` | Output format: `table`, `list`, or `json` |
 
 ---
 

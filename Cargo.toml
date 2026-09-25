@@ -15,6 +15,7 @@ readme = "README.md"
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+crossterm = "0.28"
 
 # SQLite (bundled = SQLite compilado estáticamente, sin dependencias externas)
 rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
@@ -51,6 +52,7 @@ indicatif = "0.18"
 
 # Random (for synthetic embeddings)
 rand = "0.10"
+ratatui = "0.29"
 
 # Ordered HashMap (for predictable iteration)
 indexmap = "2"
