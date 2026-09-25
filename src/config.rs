@@ -22,6 +22,8 @@ pub struct GraphRagConfig {
     pub embed_model: String,
     /// Modelo para extracción de entidades (NER)
     pub ner_model: String,
+    /// Modelo para summarización de comunidades
+    pub summary_model: String,
     /// Número de resultados por defecto
     pub k: usize,
     /// Profundidad de expansión por defecto
@@ -39,8 +41,9 @@ impl Default for GraphRagConfig {
         Self {
             db: "graph.db".into(),
             ollama_url: "http://localhost:11434".into(),
-            embed_model: "nomic-embed-text".into(),
+            embed_model: "bge-m3:latest".into(),
             ner_model: "llama3.2:3b".into(),
+            summary_model: "llama3.2:3b".into(),
             k: 5,
             depth: 2,
             alpha: 0.7,
@@ -74,10 +77,13 @@ db = "graph.db"
 ollama_url = "http://localhost:11434"
 
 # Embedding model (used when --ollama is passed)
-embed_model = "nomic-embed-text"
+embed_model = "bge-m3:latest"
 
 # Model for entity extraction during build
 ner_model = "llama3.2:3b"
+
+# Model for community summarization
+summary_model = "llama3.2:3b"
 
 # Default number of search results
 k = 5
@@ -164,7 +170,9 @@ mod tests {
         let cfg = GraphRagConfig::default();
         assert_eq!(cfg.db, "graph.db");
         assert_eq!(cfg.ollama_url, "http://localhost:11434");
-        assert_eq!(cfg.embed_model, "nomic-embed-text");
+        assert_eq!(cfg.embed_model, "bge-m3:latest");
+        assert_eq!(cfg.ner_model, "llama3.2:3b");
+        assert_eq!(cfg.summary_model, "llama3.2:3b");
         assert_eq!(cfg.k, 5);
         assert_eq!(cfg.depth, 2);
         assert!((cfg.alpha - 0.7).abs() < 0.01);
@@ -184,7 +192,7 @@ depth = 3
         assert_eq!(cfg.k, 10);
         assert_eq!(cfg.depth, 3);
         // Los valores no especificados deben tener los defaults de serde(default)
-        assert_eq!(cfg.embed_model, "nomic-embed-text");
+        assert_eq!(cfg.embed_model, "bge-m3:latest");
     }
 
     #[test]

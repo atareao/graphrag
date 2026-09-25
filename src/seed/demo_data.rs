@@ -1,10 +1,8 @@
 //! Generates a complete demo database with 20 notes, 24 entities,
-//! and computed relationships using synthetic deterministic embeddings.
+//! and computed relationships using Ollama embeddings.
 //!
+//! Requires Ollama to be running with an embedding model.
 //! This is the Rust equivalent of the original Python `seed_data.py`.
-//! No Ollama or external embedding service is required — all vectors
-//! are derived deterministically from the text content via
-//! [`crate::vector::synthetic`].
 
 use anyhow::{Context, Result};
 use log::debug;
@@ -12,10 +10,8 @@ use rusqlite::Connection;
 use serde_json::json;
 
 use crate::db::schema;
-use crate::vector::{self, synthetic};
-
-/// Dimensionality of the synthetic embeddings.
-const DIMS: usize = 1024;
+use crate::embed::ollama::OllamaClient;
+use crate::vector;
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -48,18 +44,20 @@ struct Entidad {
 /// and then all nodes and edges are inserted inside a single transaction
 /// for performance.
 ///
+/// Requires a running Ollama server for embeddings.
+///
 /// # Errors
 ///
 /// Returns an error if any SQLite operation fails (permissions, disk
-/// full, schema violation, …).
+/// full, schema violation, …) or if Ollama is unreachable.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use graphrag_seed::create_demo_db;
-/// create_demo_db("/tmp/demo.graphrag.db")?;
+/// create_demo_db("/tmp/demo.graphrag.db", "http://localhost:11434", "nomic-embed-text")?;
 /// ```
-pub fn create_demo_db(path: &str) -> Result<()> {
+pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result<()> {
     // Remove an existing database so we start clean.
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}-wal"));
@@ -67,6 +65,8 @@ pub fn create_demo_db(path: &str) -> Result<()> {
 
     let conn = Connection::open(path).context("failed to open database")?;
     schema::init_db(&conn).context("failed to initialise schema")?;
+
+    let ollama = OllamaClient::new(ollama_url, embed_model);
 
     // Wrap all inserts in a single transaction for performance.
     let tx = conn
@@ -200,7 +200,7 @@ pub fn create_demo_db(path: &str) -> Result<()> {
     ];
 
     for ent in &entidades {
-        let emb = synthetic::synthetic_embedding(&ent.label, DIMS);
+        let emb = ollama.embed(&ent.label)?;
         let blob = vector::vector_to_blob(&emb);
 
         tx.execute(
@@ -343,8 +343,8 @@ pub fn create_demo_db(path: &str) -> Result<()> {
     ];
 
     for nota in &notas {
-        // Embedding determinista con pequeña variación basada en el contenido
-        let emb = synthetic::similar_embedding(&nota.content, 0.05, DIMS);
+        // Embedding via Ollama — deterministic per content string
+        let emb = ollama.embed(&nota.content)?;
         let blob = vector::vector_to_blob(&emb);
 
         tx.execute(
@@ -498,13 +498,14 @@ mod tests {
     use super::*;
 
     /// Verify that `create_demo_db` produces the expected number of
-    /// nodes and edges.
+    /// nodes and edges. Requires Ollama.
     #[test]
+    #[ignore = "needs Ollama"]
     fn demo_db_has_expected_counts() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap();
 
-        create_demo_db(path).unwrap();
+        create_demo_db(path, "http://localhost:11434", "nomic-embed-text").unwrap();
 
         let conn = Connection::open(path).unwrap();
 
@@ -523,12 +524,13 @@ mod tests {
         assert!(edges >= 80, "expected at least 80 edges, got {edges}");
     }
 
-    /// Every note should have a non-null embedding.
+    /// Every note should have a non-null embedding. Requires Ollama.
     #[test]
+    #[ignore = "needs Ollama"]
     fn all_notes_have_embeddings() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap();
-        create_demo_db(path).unwrap();
+        create_demo_db(path, "http://localhost:11434", "nomic-embed-text").unwrap();
 
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn
@@ -538,12 +540,13 @@ mod tests {
         assert_eq!(null_embeddings, 0, "all notes must have embeddings");
     }
 
-    /// Every entity should have a non-null embedding.
+    /// Every entity should have a non-null embedding. Requires Ollama.
     #[test]
+    #[ignore = "needs Ollama"]
     fn all_entities_have_embeddings() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap();
-        create_demo_db(path).unwrap();
+        create_demo_db(path, "http://localhost:11434", "nomic-embed-text").unwrap();
 
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn
@@ -553,12 +556,13 @@ mod tests {
         assert_eq!(null_embeddings, 0, "all entities must have embeddings");
     }
 
-    /// Verify that the `mentioned_in` edges exist between entities and notes.
+    /// Verify that the `mentioned_in` edges exist between entities and notes. Requires Ollama.
     #[test]
+    #[ignore = "needs Ollama"]
     fn mentioned_in_edges_exist() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap();
-        create_demo_db(path).unwrap();
+        create_demo_db(path, "http://localhost:11434", "nomic-embed-text").unwrap();
 
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn
@@ -568,12 +572,13 @@ mod tests {
         assert!(count > 0, "expected mentioned_in edges");
     }
 
-    /// Verify that the `co_occurs_with` edges exist between entities.
+    /// Verify that the `co_occurs_with` edges exist between entities. Requires Ollama.
     #[test]
+    #[ignore = "needs Ollama"]
     fn co_occurs_with_edges_exist() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap();
-        create_demo_db(path).unwrap();
+        create_demo_db(path, "http://localhost:11434", "nomic-embed-text").unwrap();
 
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn
@@ -583,12 +588,13 @@ mod tests {
         assert_eq!(count, 43, "expected 43 co_occurs_with edges");
     }
 
-    /// The FTS5 index should be populated for notes (repopulated after build).
+    /// The FTS5 index should be populated for notes (repopulated after build). Requires Ollama.
     #[test]
+    #[ignore = "needs Ollama"]
     fn fts_index_contains_notes() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_str().unwrap();
-        create_demo_db(path).unwrap();
+        create_demo_db(path, "http://localhost:11434", "nomic-embed-text").unwrap();
 
         let conn = Connection::open(path).unwrap();
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM notes_fts").unwrap();

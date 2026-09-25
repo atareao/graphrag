@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
+use crate::community;
 use crate::graph;
 use crate::search::HybridSearch;
 
@@ -130,9 +131,9 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "query": { "type": "string", "description": "Consulta de búsqueda" },
                     "k": { "type": "number", "description": "Número de resultados", "default": 5 },
-                    "depth": { "type": "number", "description": "Profundidad de expansión en el grafo", "default": 2 },
+                    "depth": { "type": "number", "description": "Profundidad de expansión en el grafo (0 = solo vectorial)", "default": 2 },
                     "alpha": { "type": "number", "description": "Peso vectorial (0.0-1.0)", "default": 0.7 },
-                    "vector_only": { "type": "boolean", "description": "Solo vectorial sin grafo", "default": false }
+                    "filter": { "type": "array", "items": { "type": "string" }, "description": "Filtros de metadatos (repeatable): 'campo operador valor'" }
                 },
                 "required": ["query"]
             }
@@ -189,6 +190,43 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {}
             }
+        },
+        {
+            "name": "community_detect",
+            "description": "Detecta comunidades en el grafo de entidades usando el algoritmo Leiden",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "resolution": { "type": "number", "description": "Parámetro de resolución para CPM (default: 1.0)", "default": 1.0 }
+                }
+            }
+        },
+        {
+            "name": "community_summarize",
+            "description": "Genera resúmenes LLM para todas las comunidades detectadas",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "summary_model": { "type": "string", "description": "Modelo para generación de resúmenes", "default": "llama3.2:3b" },
+                    "ollama_url": { "type": "string", "description": "URL de Ollama", "default": "http://localhost:11434" },
+                    "embed_model": { "type": "string", "description": "Modelo de embeddings", "default": "nomic-embed-text" }
+                }
+            }
+        },
+        {
+            "name": "search_answer",
+            "description": "Búsqueda con respuesta narrativa usando contexto de comunidades + chunks",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Consulta" },
+                    "k": { "type": "number", "description": "Número de resultados", "default": 5 },
+                    "depth": { "type": "number", "description": "Profundidad de expansión (0 = solo vectorial)", "default": 2 },
+                    "alpha": { "type": "number", "description": "Peso vectorial (0.0-1.0)", "default": 0.7 },
+                    "summary_model": { "type": "string", "description": "Modelo para generación de respuesta", "default": "llama3.2:3b" }
+                },
+                "required": ["query"]
+            }
         }
     ])
 }
@@ -224,6 +262,23 @@ fn resource_definitions() -> Value {
             "uri": "graphrag://entities",
             "name": "Entidades extraídas",
             "description": "Nodos de tipo 'entity' o similares",
+            "mimeType": "application/json"
+        },
+        {
+            "uri": "graphrag://communities",
+            "name": "Todas las comunidades",
+            "description": "Lista de comunidades detectadas con sus resúmenes",
+            "mimeType": "application/json"
+        }
+    ])
+}
+
+fn resource_template_definitions() -> Value {
+    json!([
+        {
+            "uriTemplate": "graphrag://communities/{id}",
+            "name": "Comunidad por ID",
+            "description": "Detalle de una comunidad específica (ID numérico)",
             "mimeType": "application/json"
         }
     ])
@@ -272,7 +327,8 @@ fn handle_resources_list(req: &JsonRpcRequest) -> JsonRpcResponse {
     JsonRpcResponse::success(
         req.id.clone(),
         json!({
-            "resources": resource_definitions()
+            "resources": resource_definitions(),
+            "resourceTemplates": resource_template_definitions()
         }),
     )
 }
@@ -289,14 +345,21 @@ fn handle_resources_read(req: &JsonRpcRequest, state: &McpState) -> JsonRpcRespo
     };
 
     let result = match uri {
-        "graphrag://stats" => handle_resource_stats(&state.db_path),
+        "graphrag://stats" => {
+            handle_resource_stats(&state.db_path, &state.ollama_url, &state.embed_model)
+        }
         "graphrag://nodes" => handle_resource_nodes(&state.db_path, None),
         "graphrag://notes" => handle_resource_nodes(&state.db_path, Some("note")),
         "graphrag://entities" => handle_resource_nodes(&state.db_path, Some("entity")),
+        "graphrag://communities" => handle_resource_communities(&state.db_path),
         "graphrag://edges" => handle_resource_edges(&state.db_path, None),
         u if u.starts_with("graphrag://nodes/") => {
             let id = u.trim_start_matches("graphrag://nodes/");
             handle_resource_node_by_label(&state.db_path, id)
+        }
+        u if u.starts_with("graphrag://communities/") => {
+            let id = u.trim_start_matches("graphrag://communities/");
+            handle_resource_community_by_id(&state.db_path, id)
         }
         u => {
             return JsonRpcResponse::error(
@@ -354,6 +417,9 @@ fn handle_tools_call(req: &JsonRpcRequest, state: &McpState) -> JsonRpcResponse 
         "path" => handle_tool_path(args, state),
         "stats" => handle_tool_stats(args, state),
         "seed" => handle_tool_seed(args, state),
+        "community_detect" => handle_tool_community_detect(args, state),
+        "community_summarize" => handle_tool_community_summarize(args, state),
+        "search_answer" => handle_tool_search_answer(args, state),
         other => {
             return JsonRpcResponse::error(
                 req.id.clone(),
@@ -417,18 +483,24 @@ fn handle_tool_search(args: &Value, state: &McpState) -> Result<String> {
     let k = args.get("k").and_then(|v| v.as_f64()).unwrap_or(5.0) as usize;
     let depth = args.get("depth").and_then(|v| v.as_f64()).unwrap_or(2.0) as i32;
     let alpha = args.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.7);
-    let vector_only = args
-        .get("vector_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
-    let mut hs = HybridSearch::new(&state.db_path, None)?;
+    // Parse optional filters from MCP args (array of strings)
+    let filters: Vec<crate::search::filter::Filter> = args
+        .get("filter")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(crate::search::filter::parse_filter)
+                .collect::<anyhow::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
 
-    let results = if vector_only {
-        hs.vector_only(query, k)?
-    } else {
-        hs.hybrid_search(query, k, depth, alpha, None, false)?
-    };
+    let ollama = crate::embed::ollama::OllamaClient::new(&state.ollama_url, &state.embed_model);
+    let mut hs = HybridSearch::new(&state.db_path, ollama)?;
+
+    let results = hs.hybrid_search(query, k, depth, alpha, None, false, &filters)?;
 
     if results.is_empty() {
         return Ok("(sin resultados)".to_string());
@@ -449,13 +521,11 @@ fn handle_tool_search(args: &Value, state: &McpState) -> Result<String> {
             file_str,
             r.r#type
         ));
+        if !r.chunk_header.is_empty() {
+            out.push_str(&format!("   ├── {}\n", r.chunk_header));
+        }
         if !r.content.is_empty() {
-            let snippet = if r.content.len() > 120 {
-                format!("{}...", &r.content[..120])
-            } else {
-                r.content.clone()
-            };
-            out.push_str(&format!("   {}\n", snippet));
+            out.push_str(&format!("   └── {}\n", r.content));
         }
         if !r.neighbors.is_empty() {
             let n_list: Vec<String> = r
@@ -477,8 +547,9 @@ fn handle_tool_fts(args: &Value, state: &McpState) -> Result<String> {
 
     let limit = args.get("limit").and_then(|v| v.as_f64()).unwrap_or(10.0) as usize;
 
-    let hs = HybridSearch::new(&state.db_path, None)?;
-    let results = hs.fts_search(query, limit)?;
+    let ollama = crate::embed::ollama::OllamaClient::new(&state.ollama_url, &state.embed_model);
+    let hs = HybridSearch::new(&state.db_path, ollama)?;
+    let results = hs.fts_search(query, limit, false)?;
 
     if results.is_empty() {
         return Ok("(sin resultados)".to_string());
@@ -499,7 +570,8 @@ fn handle_tool_graph(args: &Value, state: &McpState) -> Result<String> {
 
     let depth = args.get("depth").and_then(|v| v.as_f64()).unwrap_or(2.0) as i32;
 
-    let hs = HybridSearch::new(&state.db_path, None)?;
+    let ollama = crate::embed::ollama::OllamaClient::new(&state.ollama_url, &state.embed_model);
+    let hs = HybridSearch::new(&state.db_path, ollama)?;
     let neighbors = hs.graph_only(label, depth)?;
 
     if neighbors.is_empty() {
@@ -548,22 +620,96 @@ fn handle_tool_path(args: &Value, state: &McpState) -> Result<String> {
 }
 
 fn handle_tool_stats(_args: &Value, state: &McpState) -> Result<String> {
-    let hs = HybridSearch::new(&state.db_path, None)?;
+    let ollama = crate::embed::ollama::OllamaClient::new(&state.ollama_url, &state.embed_model);
+    let hs = HybridSearch::new(&state.db_path, ollama)?;
     let stats = hs.stats()?;
     Ok(stats.to_string())
 }
 
 fn handle_tool_seed(_args: &Value, state: &McpState) -> Result<String> {
-    crate::seed::demo_data::create_demo_db(&state.db_path)?;
+    crate::seed::demo_data::create_demo_db(&state.db_path, &state.ollama_url, &state.embed_model)?;
     Ok(format!("✅ Base de datos demo creada en {}", state.db_path))
+}
+
+fn handle_tool_community_detect(args: &Value, state: &McpState) -> Result<String> {
+    let resolution = args
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    let (level1, level2) = community::detect::run_community_detection(&state.db_path, resolution)?;
+    Ok(format!(
+        "✅ Comunidades detectadas: {} nivel 1, {} nivel 2",
+        level1, level2
+    ))
+}
+
+fn handle_tool_community_summarize(args: &Value, state: &McpState) -> Result<String> {
+    let ollama_url = args
+        .get("ollama_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&state.ollama_url);
+    let summary_model = args
+        .get("summary_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama3.2:3b");
+    let embed_model = args
+        .get("embed_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&state.embed_model);
+    let (count, tokens) = community::summarize::summarize_all_communities(
+        &state.db_path,
+        ollama_url,
+        summary_model,
+        embed_model,
+    )?;
+    if count == 0 {
+        Ok("✅ Todas las comunidades ya tienen resumen".to_string())
+    } else {
+        Ok(format!(
+            "✅ {} comunidades resumidas ({} tokens)",
+            count, tokens
+        ))
+    }
+}
+
+fn handle_tool_search_answer(args: &Value, state: &McpState) -> Result<String> {
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'query' argument"))?;
+    let k = args.get("k").and_then(|v| v.as_f64()).unwrap_or(5.0) as usize;
+    let depth = args.get("depth").and_then(|v| v.as_f64()).unwrap_or(2.0) as i32;
+    let alpha = args.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.7);
+    let summary_model = args
+        .get("summary_model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama3.2:3b");
+
+    let ollama = crate::embed::ollama::OllamaClient::new(&state.ollama_url, &state.embed_model);
+    let mut hs = HybridSearch::new(&state.db_path, ollama.clone())?;
+    let results = hs.hybrid_search(query, k, depth, alpha, None, false, &[])?;
+
+    let conn = rusqlite::Connection::open(&state.db_path)?;
+    let community_embeddings =
+        crate::db::communities::load_all_community_embeddings(&conn).unwrap_or_default();
+
+    let answer = community::search::answer_query(
+        &ollama,
+        query,
+        &results,
+        &community_embeddings,
+        summary_model,
+    )?;
+    Ok(answer)
 }
 
 // ---------------------------------------------------------------------------
 // Handlers de recursos
 // ---------------------------------------------------------------------------
 
-fn handle_resource_stats(db_path: &str) -> Result<String> {
-    let hs = HybridSearch::new(db_path, None)?;
+fn handle_resource_stats(db_path: &str, ollama_url: &str, embed_model: &str) -> Result<String> {
+    let ollama = crate::embed::ollama::OllamaClient::new(ollama_url, embed_model);
+    let hs = HybridSearch::new(db_path, ollama)?;
     let stats = hs.stats()?;
     Ok(json!({
         "nodes": stats.nodes,
@@ -578,7 +724,7 @@ fn handle_resource_nodes(db_path: &str, filter_type: Option<&str>) -> Result<Str
 
     let (sql, label) = match filter_type {
         Some(t) => (
-            format!("SELECT id, label, type, metadata FROM nodes WHERE type = ?1"),
+            "SELECT id, label, type, metadata FROM nodes WHERE type = ?1".to_string(),
             t.to_string(),
         ),
         None => (
@@ -664,6 +810,53 @@ fn handle_resource_edges(db_path: &str, _type_filter: Option<&str>) -> Result<St
         .collect();
 
     Ok(json!({"edges": rows, "total": rows.len()}).to_string())
+}
+
+fn handle_resource_communities(db_path: &str) -> Result<String> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let communities = crate::db::communities::get_all_communities(&conn)?;
+    let json = serde_json::to_string_pretty(
+        &communities
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "label": c.label,
+                    "level": c.level,
+                    "parent_id": c.parent_id,
+                    "summary": c.summary,
+                    "member_count": c.member_count,
+                    "algorithm": c.algorithm,
+                    "summary_tokens": c.summary_tokens,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(json)
+}
+
+fn handle_resource_community_by_id(db_path: &str, id_str: &str) -> Result<String> {
+    let id: i64 = id_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid community ID: {}", id_str))?;
+    let conn = rusqlite::Connection::open(db_path)?;
+    let community = crate::db::communities::get_community_by_id(&conn, id)?
+        .ok_or_else(|| anyhow::anyhow!("Community not found: {}", id))?;
+    let json = serde_json::to_string_pretty(&serde_json::json!({
+        "id": community.id,
+        "label": community.label,
+        "level": community.level,
+        "parent_id": community.parent_id,
+        "summary": community.summary,
+        "member_ids": community.member_ids,
+        "member_count": community.member_count,
+        "algorithm": community.algorithm,
+        "quality_fn": community.quality_fn,
+        "resolution": community.resolution,
+        "summary_model": community.summary_model,
+        "summary_tokens": community.summary_tokens,
+    }))?;
+    Ok(json)
 }
 
 // ---------------------------------------------------------------------------

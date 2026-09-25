@@ -3,16 +3,25 @@ use log::debug;
 use serde::Deserialize;
 
 /// Cliente HTTP para el API de embeddings de Ollama
+#[derive(Clone)]
 pub struct OllamaClient {
     pub url: String,
     pub model: String,
     client: reqwest::blocking::Client,
+    #[allow(dead_code)]
+    generate_client: reqwest::blocking::Client,
 }
 
-// Ollama API response structure
+// Ollama API response structures
 #[derive(Deserialize)]
 struct EmbeddingResponse {
     embedding: Vec<f32>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct GenerateResponse {
+    response: String,
 }
 
 impl OllamaClient {
@@ -27,6 +36,10 @@ impl OllamaClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("Failed to create HTTP client"),
+            generate_client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("Failed to create HTTP generate client"),
         }
     }
 
@@ -107,8 +120,17 @@ impl OllamaClient {
         Ok(())
     }
 
+    /// Genera embeddings para múltiples textos en lote.
+    ///
+    /// Llama a `/api/embeddings` para cada texto individualmente,
+    /// compatible con todas las versiones de Ollama.
+    pub fn batch_embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+
     /// Intenta obtener la dimensión del modelo de embeddings
     /// nomic-embed-text = 384, bge-m3 = 1024
+    #[allow(dead_code)]
     pub fn embedding_dimension(&self) -> usize {
         if self.model.contains("bge-m3") || self.model.contains("bge-large") {
             1024
@@ -118,6 +140,70 @@ impl OllamaClient {
             1024
         } else {
             768 // default fallback
+        }
+    }
+
+    /// Generate text via Ollama's /api/generate endpoint.
+    ///
+    /// Sends a prompt to the specified model and returns the generated response text.
+    /// Use `format = Some("json")` to enable Ollama's JSON mode for structured output.
+    ///
+    /// # Arguments
+    /// * `prompt` - The full prompt text to send to the model
+    /// * `model` - Which model to use (e.g., "llama3.2:3b")
+    /// * `format` - Optional — pass `"json"` as Some("json") to enable JSON mode
+    #[allow(dead_code)]
+    pub fn generate(&self, prompt: &str, model: &str, format: Option<&str>) -> Result<String> {
+        let format_value = match format {
+            Some("json") => serde_json::json!("json"),
+            _ => serde_json::Value::Null,
+        };
+
+        let body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "format": format_value,
+        });
+
+        let resp = self
+            .generate_client
+            .post(format!("{}/api/generate", self.url))
+            .json(&body)
+            .send()
+            .context("Error connecting to Ollama for generation. Is it running?")?
+            .error_for_status()
+            .context(format!("Ollama generate API error for model '{}'", model))?;
+
+        let data: GenerateResponse = resp.json().context("Failed to parse generate response")?;
+
+        let preview: String = prompt.chars().take(60).collect();
+        debug!(
+            "Ollama generate: model={}, prompt='{}...' → {} chars response",
+            model,
+            preview,
+            data.response.len()
+        );
+
+        Ok(data.response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs Ollama"]
+    fn test_batch_embed_returns_correct_count() {
+        let client = OllamaClient::new("http://localhost:11434", "nomic-embed-text");
+        let texts = &["Hello world", "Rust programming language"];
+        let result = client
+            .batch_embed(texts)
+            .expect("batch_embed should succeed");
+        assert_eq!(result.len(), 2, "should return one embedding per text");
+        for emb in &result {
+            assert!(!emb.is_empty(), "each embedding should be non-empty");
         }
     }
 }
