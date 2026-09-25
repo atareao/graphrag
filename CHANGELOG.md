@@ -1,10 +1,32 @@
 # Changelog
+## [0.2.2] - 2026-09-25
+
+### Bug Fixes
+
+- Use GITHUB_TOKEN instead of GH_PAT for checkout
+
+### Features
+
+- Add graphrag similar command with --label and --file modes
+- Add graphrag similar command
+
+### Miscellaneous Tasks
+
+- Sync development with main (v0.2.0)
+
+### Other
+
+- V0.3.0
 ## [0.2.1] - 2026-09-25
 
 ### Documentation
 
 - Add Spanish README and translate beginners section to English
 - Add Spanish README and translate beginners section to English
+
+### Miscellaneous Tasks
+
+- Release v0.2.1
 ## [0.2.0] - 2026-09-25
 
 ### Bug Fixes
