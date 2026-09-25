@@ -60,4 +60,7 @@ jobs:
       - name: Sync development with main
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT repos/${{ github.repository }}/git/refs/heads/development -f sha=$(git rev-parse HEAD)
+        run: |
+          gh api -X PATCH repos/${{ github.repository }}/git/refs/heads/development \
+            -f sha=$(git rev-parse HEAD) \
+            -f force=true
