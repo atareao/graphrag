@@ -223,6 +223,7 @@ Query "Python databases"
 | 📄 | **FTS5 full-text search** | Classic keyword search when you know exactly what you're looking for |
 | 🔗 | **Path finding** | Shortest path between any two nodes — discover surprising connections |
 | 📊 | **Graph statistics** | Understand your knowledge base structure at a glance |
+| 🖥️ | **Concept map TUI** (`map`) | Interactive terminal UI to visually explore the knowledge graph — navigate nodes, inspect details, filter by type |
 | ⚡ | **Incremental builds** | Only processes new/modified files (SHA256). Second build is instant |
 | 🔄 | **Parallel NER** | N worker threads for entity extraction, 1 serial writer — no SQLite lock contention |
 | 🤖 | **MCP server** | Claude Desktop, Cline, and other AI assistants can query your graph in real-time |
@@ -299,6 +300,9 @@ graphrag fts "Python" graph.db -l 10
 graphrag graph "Docker" graph.db -d 1
 graphrag path "Python" "Docker" graph.db
 graphrag stats graph.db
+
+# Interactive concept map
+graphrag map graph.db
 
 # Clean up when done
 graphrag reset graph.db
@@ -421,6 +425,7 @@ graphrag <COMMAND> [ARGS] [OPTIONS]
 | [`search`](#graphrag-search-query-db) | 🔍 Hybrid vector + graph search |
 | [`fts`](#graphrag-fts-query-db) | 📄 Exact full-text search (FTS5) |
 | [`graph`](#graphrag-graph-label-db) | 🕸️ Show neighbors of a node |
+| [`map`](#graphrag-map-db) | 🖥️ Interactive concept map TUI |
 | [`path`](#graphrag-path-from-to-db) | 🔗 Shortest path between two nodes |
 | [`seed`](#graphrag-seed-db) | 🌱 Populate demo data |
 | [`stats`](#graphrag-stats-db) | 📊 Graph statistics |
@@ -644,6 +649,36 @@ Show neighbors of a node in the knowledge graph. Great for exploring.
 ```bash
 graphrag graph "Docker" graph.db -d 2
 ```
+
+---
+
+### `graphrag map [DB]`
+
+Interactive concept map TUI — visually explore the knowledge graph in the terminal.
+
+```bash
+# Full graph
+graphrag map graph.db
+
+# Subgraph centered on a node
+graphrag map --from Python --depth 3 graph.db
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--from` | — | Starting node label (omit for full graph) |
+| `-d` | 2 | Graph expansion depth from starting node |
+
+**Controls:**
+
+| Key | Action |
+|-----|--------|
+| `↑↓←→` / `hjkl` | Navigate between nodes |
+| `Enter` | Select node (details in right panel) |
+| `t` | Cycle filter: all → notes → entities → tags |
+| `/` | Search nodes by name |
+| `q` / `Esc` | Quit |
+| Mouse click | Select node |
 
 ---
 
@@ -884,6 +919,10 @@ Expose your knowledge graph to any MCP-compatible AI assistant (Claude Desktop, 
 │   │   └── markdown.rs      ← Frontmatter parsing + section chunking
 │   ├── ner/
 │   │   └── ollama_ner.rs    ← LLM entity extraction (batch mode)
+│   ├── map/
+│   │   ├── mod.rs           ← Data loading (load_graph, cmd_map)
+│   │   ├── layout.rs        ← Force-directed layout algorithm
+│   │   └── tui.rs           ← Interactive TUI (ratatui)
 │   └── seed/
 │       └── demo_data.rs     ← Demo data generator (44 nodes, 113 edges)
 ```
@@ -978,7 +1017,7 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
 ## 🧪 Tests
 
 ```bash
-# All tests (30 tests, no external services needed)
+# All tests (123 tests, no external services needed)
 cargo test
 
 # Ollama-dependent tests (2 tests, requires Ollama running)
