@@ -1,10 +1,34 @@
 # Changelog
+## [0.2.4] - 2026-09-25
+
+### Documentation
+
+- Add Spanish README (README.es.md)
+- Add --format flag documentation to READMEs
+- Add map command documentation to READMEs
+- Add map command documentation to READMEs
+
+### Features
+
+- Add --format flag (table|list|json) to search, similar, fts (#9)
+- Add interactive concept map TUI with ratatui
+- Add interactive concept map TUI with ratatui
+
+### Miscellaneous Tasks
+
+- Resolve merge conflict in README.es.md
+- Release v0.3.0 (#10)
+- Release v0.3.0
 ## [0.2.3] - 2026-09-25
 
 ### Bug Fixes
 
 - Clip_text utf8 char boundary panic
 - Clip_text utf8 char boundary panic
+
+### Miscellaneous Tasks
+
+- Release v0.2.3
 ## [0.2.2] - 2026-09-25
 
 ### Bug Fixes
