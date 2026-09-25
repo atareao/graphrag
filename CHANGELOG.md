@@ -1,4 +1,10 @@
 # Changelog
+## [0.2.3] - 2026-09-25
+
+### Bug Fixes
+
+- Clip_text utf8 char boundary panic
+- Clip_text utf8 char boundary panic
 ## [0.2.2] - 2026-09-25
 
 ### Bug Fixes
@@ -13,6 +19,7 @@
 ### Miscellaneous Tasks
 
 - Sync development with main (v0.2.0)
+- Release v0.2.2
 
 ### Other
 
