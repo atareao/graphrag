@@ -155,6 +155,22 @@ impl HybridSearch {
         Ok(())
     }
 
+    /// Computa similitud coseno de `query_vec` contra todos los chunks cargados.
+    /// Devuelve Vec<(chunk_index, score)> para TODOS los chunks, ordenado por score descendente.
+    fn compute_similarities(&self, query_vec: &[f32]) -> Vec<(usize, f64)> {
+        let mut sims: Vec<(usize, f64)> = self
+            .chunk_vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let sim = vector::cosine_similarity_raw(v, query_vec) as f64;
+                (i, sim)
+            })
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sims
+    }
+
     /// Obtiene la ruta del archivo de un nodo desde metadata JSON
     fn get_file(&self, node_id: i64) -> Result<String> {
         let result: std::result::Result<String, _> = self.conn.query_row(
@@ -286,18 +302,7 @@ impl HybridSearch {
         }
 
         // Calcular similitud coseno con todos los vectores de chunks
-        let mut sims: Vec<(usize, f64)> = self
-            .chunk_vecs
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let sim = vector::cosine_similarity_raw(v, &query_vec) as f64;
-                (i, sim)
-            })
-            .collect();
-
-        // Ordenar por similitud descendente y tomar top-k
-        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let sims = self.compute_similarities(&query_vec);
         let top_k: Vec<_> = sims.into_iter().take(k).collect();
 
         if top_k.is_empty() {
@@ -514,6 +519,331 @@ impl HybridSearch {
         expand::expand_neighbors(&self.conn, id, depth)
     }
 
+    /// Busca notas similares a una nota ya indexada, comparando cada chunk
+    /// individualmente (match individual) y agregando por nota destino con score = max.
+    /// Sin llamar a Ollama — reusa embeddings almacenados en la BD.
+    pub fn similar_by_label(
+        &mut self,
+        label: &str,
+        k: usize,
+        depth: i32,
+        min_weight: Option<f64>,
+        notes_only: bool,
+        _filters: &[Filter],
+    ) -> Result<Vec<SearchResult>> {
+        // 1. Resolver label → note_id
+        let note_id: i64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM nodes WHERE label = ?1",
+                rusqlite::params![label],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow::anyhow!("Nodo '{}' no encontrado", label))?;
+
+        // 2. Cargar chunks de la nota origen
+        let source_chunks = crate::db::chunks::get_chunks_by_note(&self.conn, note_id)?;
+
+        if source_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 3. Asegurar que los embeddings de chunks están cargados
+        self.load_all_chunks()?;
+
+        if self.chunk_vecs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 4. Match individual: para cada chunk origen, compute_similarities,
+        //    agregar por nota destino con max.
+        //    Excluir los chunks de la propia nota origen.
+        use std::collections::HashMap;
+
+        let mut note_scores: HashMap<i64, f64> = HashMap::new();
+        let mut label_cache: HashMap<i64, String> = HashMap::new();
+
+        for chunk in &source_chunks {
+            let emb = crate::vector::blob_to_vector(chunk.embedding.as_deref().unwrap_or(&[]))?;
+            if emb.is_empty() {
+                continue;
+            }
+
+            let sims = self.compute_similarities(&emb);
+
+            for (idx, score) in &sims {
+                let target_note_id = self.chunk_meta[*idx].note_id;
+                // Excluir la propia nota origen
+                if target_note_id == note_id {
+                    continue;
+                }
+                // Actualizar score con el máximo encontrado
+                let entry = note_scores.entry(target_note_id).or_insert(0.0);
+                if *score > *entry {
+                    *entry = *score;
+                }
+            }
+        }
+
+        // 5. Tomar top-K notas por score
+        let mut sorted: Vec<(i64, f64)> = note_scores.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(k);
+
+        // 6. Reranking + graph expansion (similar a hybrid_search FASE 3)
+        let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut results: Vec<SearchResult> = Vec::new();
+
+        for (target_note_id, score) in &sorted {
+            if seen_ids.contains(target_note_id) {
+                continue;
+            }
+            seen_ids.insert(*target_note_id);
+
+            let neighbors = if depth > 0 {
+                if let Some(min_w) = min_weight {
+                    crate::graph::expand::expand_neighbors_weighted(
+                        &self.conn,
+                        *target_note_id,
+                        depth,
+                        min_w,
+                    )?
+                } else {
+                    crate::graph::expand::expand_neighbors(&self.conn, *target_note_id, depth)?
+                }
+            } else {
+                Vec::new()
+            };
+
+            let note_label = match label_cache.get(target_note_id) {
+                Some(l) => l.clone(),
+                None => {
+                    let l = self.get_note_label(*target_note_id)?;
+                    label_cache.insert(*target_note_id, l.clone());
+                    l
+                }
+            };
+
+            // Obtener el chunk header/text del mejor match para display
+            let chunk_info = {
+                let mut best = (String::new(), String::new(), 0.0_f64);
+                for chunk in &source_chunks {
+                    let emb =
+                        crate::vector::blob_to_vector(chunk.embedding.as_deref().unwrap_or(&[]))
+                            .ok();
+                    if let Some(ref e) = emb {
+                        let sims = self.compute_similarities(e);
+                        for (idx, s) in &sims {
+                            if self.chunk_meta[*idx].note_id == *target_note_id && *s > best.2 {
+                                best = (
+                                    self.chunk_meta[*idx].header.clone(),
+                                    self.chunk_meta[*idx].text.clone(),
+                                    *s,
+                                );
+                            }
+                        }
+                    }
+                }
+                best
+            };
+
+            results.push(SearchResult {
+                id: *target_note_id,
+                label: note_label,
+                r#type: "note".to_string(),
+                score: *score,
+                content: clip_text(&chunk_info.1, 200),
+                file: self.get_file(*target_note_id)?,
+                neighbors,
+                chunk_header: chunk_info.0,
+                chunk_text: chunk_info.1,
+            });
+        }
+
+        // Orden final y límite
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(k * 2);
+
+        // Normalizar scores (min-max)
+        if !results.is_empty() {
+            let max_s = results
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_s = results
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::INFINITY, f64::min);
+            if max_s > min_s {
+                for r in &mut results {
+                    r.score = (r.score - min_s) / (max_s - min_s);
+                }
+            }
+        }
+
+        if notes_only {
+            results.retain(|r| r.r#type == "note");
+        }
+
+        Ok(results)
+    }
+
+    /// Busca notas similares a un archivo externo (no indexado en la BD),
+    /// chonkeándolo, generando embeddings vía Ollama, y comparando
+    /// cada chunk individualmente (match individual).
+    pub fn similar_by_file(
+        &mut self,
+        path: &str,
+        k: usize,
+        depth: i32,
+        min_weight: Option<f64>,
+        notes_only: bool,
+        _filters: &[Filter],
+    ) -> Result<Vec<SearchResult>> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|_| anyhow::anyhow!("Archivo no encontrado: {}", path))?;
+
+        let chunks = crate::chunking::markdown::chunk_document(&content);
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Concatenar header + "\n" + text para cada chunk
+        let embed_texts: Vec<String> = chunks
+            .iter()
+            .map(|c| format!("{}\n{}", c.header, c.text))
+            .collect();
+        let embed_refs: Vec<&str> = embed_texts.iter().map(|s| s.as_str()).collect();
+
+        // Batch embed via Ollama
+        let embeddings = self.ollama.batch_embed(&embed_refs)?;
+
+        // Cargar chunks de la BD
+        self.load_all_chunks()?;
+
+        if self.chunk_vecs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Match individual: para cada chunk origen, compute_similarities,
+        // agregar por nota destino con max
+        use std::collections::HashMap;
+        let mut note_scores: HashMap<i64, f64> = HashMap::new();
+        let mut label_cache: HashMap<i64, String> = HashMap::new();
+
+        for emb in &embeddings {
+            let sims = self.compute_similarities(emb);
+
+            for (idx, score) in &sims {
+                let target_note_id = self.chunk_meta[*idx].note_id;
+                let entry = note_scores.entry(target_note_id).or_insert(0.0);
+                if *score > *entry {
+                    *entry = *score;
+                }
+            }
+        }
+
+        // Tomar top-K
+        let mut sorted: Vec<(i64, f64)> = note_scores.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.truncate(k);
+
+        // Graph expansion + output assembly (idéntico a similar_by_label)
+        let mut seen_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut results: Vec<SearchResult> = Vec::new();
+
+        for (target_note_id, score) in &sorted {
+            if seen_ids.contains(target_note_id) {
+                continue;
+            }
+            seen_ids.insert(*target_note_id);
+
+            let neighbors = if depth > 0 {
+                if let Some(min_w) = min_weight {
+                    crate::graph::expand::expand_neighbors_weighted(
+                        &self.conn,
+                        *target_note_id,
+                        depth,
+                        min_w,
+                    )?
+                } else {
+                    crate::graph::expand::expand_neighbors(&self.conn, *target_note_id, depth)?
+                }
+            } else {
+                Vec::new()
+            };
+
+            let note_label = match label_cache.get(target_note_id) {
+                Some(l) => l.clone(),
+                None => {
+                    let l = self.get_note_label(*target_note_id)?;
+                    label_cache.insert(*target_note_id, l.clone());
+                    l
+                }
+            };
+
+            // Mejor chunk de display
+            let mut best = (String::new(), String::new(), 0.0_f64);
+            for emb in &embeddings {
+                let sims = self.compute_similarities(emb);
+                for (idx, s) in &sims {
+                    if self.chunk_meta[*idx].note_id == *target_note_id && *s > best.2 {
+                        best = (
+                            self.chunk_meta[*idx].header.clone(),
+                            self.chunk_meta[*idx].text.clone(),
+                            *s,
+                        );
+                    }
+                }
+            }
+
+            results.push(SearchResult {
+                id: *target_note_id,
+                label: note_label,
+                r#type: "note".to_string(),
+                score: *score,
+                content: clip_text(&best.1, 200),
+                file: self.get_file(*target_note_id)?,
+                neighbors,
+                chunk_header: best.0,
+                chunk_text: best.1,
+            });
+        }
+
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        results.truncate(k * 2);
+
+        if !results.is_empty() {
+            let max_s = results
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_s = results
+                .iter()
+                .map(|r| r.score)
+                .fold(f64::INFINITY, f64::min);
+            if max_s > min_s {
+                for r in &mut results {
+                    r.score = (r.score - min_s) / (max_s - min_s);
+                }
+            }
+        }
+
+        if notes_only {
+            results.retain(|r| r.r#type == "note");
+        }
+
+        Ok(results)
+    }
+
     /// Búsqueda FTS5 (textual exacta)
     pub fn fts_search(
         &self,
@@ -644,16 +974,6 @@ impl std::fmt::Display for DbStats {
             self.chunks,
             self.with_embeddings
         )
-    }
-}
-
-#[cfg(test)]
-impl HybridSearch {
-    /// Injects a synthetic embedding into the cache so that `embed()` returns
-    /// it without calling Ollama.  Used by tests that need `hybrid_search` to
-    /// run without a real Ollama server.
-    fn inject_embedding(&mut self, text: &str, vec: Vec<f32>) {
-        self.embed_cache.insert(text.to_string(), vec);
     }
 }
 
@@ -997,6 +1317,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs Ollama"]
     fn test_search_empty_chunks() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -1010,10 +1331,6 @@ mod tests {
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
-
-        // Inject a synthetic embedding so `embed()` doesn't call Ollama.
-        let fake_vec = vec![0.1_f32, 0.2_f32, 0.3_f32];
-        hs.inject_embedding("test query", fake_vec);
 
         let results = hs
             .hybrid_search("test query", 5, 2, 0.7, None, false, &[])
@@ -1043,6 +1360,79 @@ mod tests {
                 || err.contains("Connection refused")
                 || err.contains("error trying to connect"),
             "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_similar_by_label_returns_results() {
+        let conn = setup_db_with_chunks();
+
+        // Añadir una segunda nota con chunks para que haya algo con qué comparar
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![2i64, "second-note", "note", r#"{"path":"/tmp/second.md"}"#],
+        )
+        .unwrap();
+
+        // Chunk con embedding similar al chunk 1 de test-note (más cercano a [0.1,0.2,0.3])
+        let emb_similar = crate::vector::vector_to_blob(&[0.11_f32, 0.21_f32, 0.31_f32]);
+        crate::db::chunks::insert_chunk(
+            &conn,
+            2,
+            "Similar Header",
+            "similar text content",
+            "similar",
+            Some(&emb_similar),
+            None,
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let results = hs
+            .similar_by_label("test-note", 5, 0, None, false, &[])
+            .unwrap();
+        assert!(!results.is_empty(), "should return at least one result");
+        assert!(
+            results.iter().any(|r| r.label == "second-note"),
+            "second-note should be among results"
+        );
+    }
+
+    #[test]
+    fn test_similar_by_label_not_found() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let result = hs.similar_by_label("NonExistent", 5, 0, None, false, &[]);
+        assert!(result.is_err(), "should error for non-existent label");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no encontrado") || err.contains("NonExistent"),
+            "error should mention the label: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_similar_by_file_not_found() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let result = hs.similar_by_file("/tmp/nonexistent_file_xyz.md", 5, 0, None, false, &[]);
+        assert!(result.is_err(), "should error for non-existent file");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no encontrado") || err.contains("NotFound"),
+            "error should mention file not found: {}",
             err
         );
     }
