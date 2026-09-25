@@ -57,6 +57,33 @@ enum Commands {
         #[arg(long, default_value = "http://localhost:11434")]
         ollama_url: String,
     },
+    /// Búsqueda por similitud: encuentra notas similares a una nota existente (--label) o a un archivo externo (--file)
+    Similar {
+        /// Etiqueta de una nota ya indexada en la BD
+        #[arg(long)]
+        label: Option<String>,
+        /// Ruta a un archivo .md externo
+        #[arg(long)]
+        file: Option<String>,
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
+        /// Número de resultados
+        #[arg(short, long, default_value = "5")]
+        k: usize,
+        /// Profundidad de expansión en el grafo
+        #[arg(short, long, default_value = "2")]
+        depth: i32,
+        /// Peso mínimo de arista para expansión
+        #[arg(long)]
+        min_weight: Option<f64>,
+        /// Solo notas (sin entidades ni tags)
+        #[arg(long)]
+        notes_only: bool,
+        /// Filtrar por campo de metadatos (repeatable). Formato: 'campo operador valor'
+        #[arg(long = "filter", value_name = "EXPR")]
+        filter: Vec<String>,
+    },
     /// Búsqueda híbrida (vectores + grafos)
     Search {
         /// Consulta de búsqueda
@@ -329,6 +356,24 @@ fn main() -> Result<()> {
                 notes_only,
                 &filter,
                 answer,
+            )
+        }
+        Commands::Similar {
+            label,
+            file,
+            db,
+            k,
+            depth,
+            min_weight,
+            notes_only,
+            filter,
+        } => {
+            let db = if db == "graphrag.db" { &cfg.db } else { &db };
+            let k = if k == 5 { cfg.k } else { k };
+            let depth = if depth == 2 { cfg.depth } else { depth };
+            debug!("Comando: similar label={:?}, file={:?}", label, file);
+            cmd_similar(
+                label, file, db, k, depth, min_weight, notes_only, &filter, &cfg,
             )
         }
         Commands::Graph { label, db, depth } => {
@@ -808,6 +853,103 @@ fn cmd_search(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_similar(
+    label: Option<String>,
+    file: Option<String>,
+    db: &str,
+    k: usize,
+    depth: i32,
+    min_weight: Option<f64>,
+    notes_only: bool,
+    filter: &[String],
+    cfg: &config::GraphRagConfig,
+) -> Result<()> {
+    // Validar que exactamente uno de --label o --file esté presente
+    match (&label, &file) {
+        (Some(_), Some(_)) => {
+            eprintln!("❌ Especifica solo uno de --label o --file, no ambos");
+            std::process::exit(1);
+        }
+        (None, None) => {
+            eprintln!("❌ Debes especificar --label o --file");
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+
+    // Parse filters
+    let filters: Vec<search::filter::Filter> = filter
+        .iter()
+        .map(|f| search::filter::parse_filter(f))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|e| {
+            eprintln!("❌ {}", e);
+            e
+        })?;
+
+    let ollama = embed::ollama::OllamaClient::new(&cfg.ollama_url, &cfg.embed_model);
+    let mut hs = search::HybridSearch::new(db, ollama.clone())?;
+
+    if let Some(lbl) = &label {
+        println!("\n🔍 Similares a: '{}'", lbl);
+        println!("   k={}, depth={}", k, depth);
+        if notes_only {
+            println!("   solo notas");
+        }
+        println!();
+
+        let results = hs.similar_by_label(lbl, k, depth, min_weight, notes_only, &filters)?;
+        display_similar_results(&results);
+    } else if let Some(f) = &file {
+        println!("\n🔍 Similares a archivo: '{}'", f);
+        println!("   k={}, depth={}", k, depth);
+        if notes_only {
+            println!("   solo notas");
+        }
+        println!();
+
+        let results = hs.similar_by_file(f, k, depth, min_weight, notes_only, &filters)?;
+        display_similar_results(&results);
+    }
+
+    Ok(())
+}
+
+fn display_similar_results(results: &[search::SearchResult]) {
+    if results.is_empty() {
+        println!("   (sin resultados)");
+        return;
+    }
+
+    for r in results {
+        let file_info = if !r.file.is_empty() {
+            format!(" ({})", r.file)
+        } else {
+            String::new()
+        };
+        let n_count = r.neighbors.len();
+        println!(
+            "   {:>10.3}  [{:8}] {}{}  (vecinos: {})",
+            r.score, r.r#type, r.label, file_info, n_count
+        );
+        if !r.chunk_header.is_empty() {
+            println!("   └── {}: {}", r.chunk_header, r.content);
+        }
+    }
+
+    // Mostrar vecinos del primer resultado
+    if let Some(first) = results.first() {
+        if !first.neighbors.is_empty() {
+            println!("\n🔗 Vecinos de '{}':", first.label);
+            println!("{}", "─".repeat(50));
+            for n in &first.neighbors {
+                println!("   [dist {}] {} ({})", n.distance, n.label, n.r#type);
+            }
+        }
+    }
 }
 
 fn cmd_community_detect(db: &str, resolution: f64) -> Result<()> {
