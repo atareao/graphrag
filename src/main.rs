@@ -4,6 +4,7 @@ mod config;
 mod db;
 mod embed;
 mod graph;
+mod map;
 mod mcp;
 mod ner;
 mod search;
@@ -12,6 +13,8 @@ mod vector;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+use crate::map::cmd_map;
 use clap_complete::Shell;
 use log::debug;
 use std::path::{Path, PathBuf};
@@ -146,6 +149,18 @@ enum Commands {
         /// Profundidad de expansión
         #[arg(short, long, default_value = "2")]
         depth: i32,
+    },
+    /// Interactive concept map TUI
+    Map {
+        /// Nodo central opcional
+        #[arg(long)]
+        from: Option<String>,
+        /// Profundidad de expansión
+        #[arg(short, long, default_value = "2")]
+        depth: i32,
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
     },
     /// Búsqueda textual exacta (FTS5)
     Fts {
@@ -402,6 +417,12 @@ fn main() -> Result<()> {
             let depth = if depth == 2 { cfg.depth } else { depth };
             debug!("Comando: graph label='{}', depth={}", label, depth);
             cmd_graph(&label, db, depth)
+        }
+        Commands::Map { from, db, depth } => {
+            let db = if db == "graphrag.db" { &cfg.db } else { &db };
+            let depth = if depth == 2 { cfg.depth } else { depth };
+            debug!("Comando: map from={:?}, depth={}", from, depth);
+            cmd_map(db, from, depth)
         }
         Commands::Fts {
             query,
