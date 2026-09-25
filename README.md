@@ -209,6 +209,34 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--min-weight` | — | Minimum edge weight for expansion |
 | `--ollama` | — | Use Ollama for embeddings (default: synthetic) |
 
+### `graphrag similar --label <LABEL> --file <PATH> [DB]`
+
+Find semantically similar notes. Two modes:
+- `--label`: find notes similar to an **existing** indexed note (no Ollama needed — uses stored embeddings)
+- `--file`: find notes similar to an **external** `.md` file (chunks and embeds via Ollama)
+
+Both modes use **match individual**: each chunk of the source is compared independently, and each target note is scored by its best-matching chunk pair.
+
+```bash
+# Find notes similar to an existing note
+$ graphrag similar --label "Python frameworks" graph.db -k 5
+
+# Find notes similar to an external file
+$ graphrag similar --file ~/drafts/new-idea.md graph.db -k 10 -d 2
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--label` | — | Label of an existing note in the database |
+| `--file` | — | Path to an external `.md` file |
+| `-k` | 5 | Number of results |
+| `-d` | 2 | Graph expansion depth |
+| `--notes-only` | — | Show only notes (no entities/tags) |
+| `--min-weight` | — | Minimum edge weight for expansion |
+| `--filter` | — | Filter by metadata field (`--filter "category = tutorial"`) |
+
+Note: `--label` and `--file` are mutually exclusive. Use exactly one.
+
 ### `graphrag fts <QUERY> [DB]`
 
 Exact text search with FTS5.

@@ -1,1 +1,0 @@
-// Module removed — all embeddings now use Ollama.
