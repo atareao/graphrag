@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
@@ -50,9 +50,17 @@ fn call_ollama(ollama_url: &str, model: &str, prompt: &str) -> Result<String> {
         .post(format!("{}/api/generate", ollama_url.trim_end_matches('/')))
         .json(&body)
         .send()
-        .context("Error connecting to Ollama for entity extraction")?
-        .error_for_status()
-        .context("Ollama returned error during entity extraction")?;
+        .context("Error connecting to Ollama for entity extraction")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(anyhow!(
+            "Ollama returned HTTP {}: {}",
+            status.as_u16(),
+            body.trim()
+        ));
+    }
 
     let resp_text = resp.text().context("Failed to read response body")?;
     let preview: String = resp_text.chars().take(200).collect();

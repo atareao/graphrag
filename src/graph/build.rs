@@ -12,11 +12,17 @@ use walkdir::WalkDir;
 
 use crate::chunking::{chunk_document, parse_frontmatter, slugify};
 use crate::db::schema;
+use crate::embed::ollama::OllamaClient;
 use crate::ner::{extract_entities_batch, Entity, DEFAULT_LABELS};
 use crate::vector;
 
-/// Dimensión de los embeddings sintéticos
-const EMBED_DIMS: usize = 1024;
+/// Datos de un chunk ya embedido listo para almacenar
+struct ChunkData {
+    header: String,
+    text: String,
+    slug: String,
+    embedding_blob: Vec<u8>,
+}
 
 /// Estadísticas de la construcción del grafo
 #[derive(Debug, Default, Clone)]
@@ -47,7 +53,7 @@ struct FileResult {
     note_title: String,
     note_metadata: String,
     batch_entities: Vec<Vec<Entity>>,
-    chunks: Vec<String>,
+    chunk_data: Vec<ChunkData>,
     parent_dir: String,
     tags: Vec<String>,
 }
@@ -84,7 +90,7 @@ pub fn build_graph(
     db_path: &str,
     ollama_url: &str,
     ner_model: &str,
-    _embed_model: &str,
+    embed_model: &str,
     num_threads: usize,
 ) -> Result<BuildStats> {
     let repo = Path::new(repo_path);
@@ -143,7 +149,7 @@ pub fn build_graph(
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
         .collect();
 
     spinner.finish_with_message(format!("✅ Encontrados {} archivos .md", md_files.len()));
@@ -214,14 +220,14 @@ pub fn build_graph(
     // Writer: una sola conexión SQLite, escritura serializada vía canal.
 
     // Determinar número de hilos (de la configuración, con límite sensato)
-    let num_threads = num_threads.max(1).min(16);
+    let num_threads = num_threads.clamp(1, 16);
 
     info!(
         "Procesando con {} hilos en paralelo (NER) + 1 escritor",
         num_threads
     );
 
-    let chunk_size = (total_to_process + num_threads - 1) / num_threads;
+    let chunk_size = total_to_process.div_ceil(num_threads);
     let chunks: Vec<&[&Path]> = to_process.chunks(chunk_size.max(1)).collect();
 
     // Canal para enviar datos de hilos → writer
@@ -232,10 +238,10 @@ pub fn build_graph(
     let pb = &pb;
     let stats_lock = &stats_lock;
     let existing = &existing;
-    let repo = repo;
     let db_path = &db_path;
     let ollama_url = &ollama_url;
     let ner_model = &ner_model;
+    let embed_model = &embed_model;
 
     // Directorios a saltar para relaciones estructurales
     let skip_dirs = ["notas", "muestra"];
@@ -267,7 +273,7 @@ pub fn build_graph(
                     note_title,
                     note_metadata,
                     batch_entities,
-                    ref chunks,
+                    ref chunk_data,
                     parent_dir,
                     tags,
                 } = result;
@@ -298,8 +304,7 @@ pub fn build_graph(
                     );
                 }
 
-                // Insertar/actualizar nodo nota con embedding sintético
-                let note_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(&note_title, EMBED_DIMS));
+                // Insertar/actualizar nodo nota (sin embedding — usamos chunks)
                 if let Err(e) = tx.execute(
                     "INSERT INTO nodes (label, type, metadata, embedding)
                      VALUES (?1, 'note', ?2, ?3)
@@ -307,7 +312,7 @@ pub fn build_graph(
                        type = excluded.type,
                        metadata = excluded.metadata,
                        embedding = excluded.embedding",
-                    rusqlite::params![note_title, note_metadata, note_emb],
+                    rusqlite::params![note_title, note_metadata, None::<&[u8]>],
                 ) {
                     log::warn!("⚠️  Error insertando nodo nota '{}': {}", note_title, e);
                     pb.lock().unwrap().inc(1);
@@ -332,8 +337,8 @@ pub fn build_graph(
                 let mut all_entity_count: usize = 0;
 
                 for (chunk_idx, entities) in batch_entities.iter().enumerate() {
-                    let chunk_ref = if chunk_idx < chunks.len() && !chunks[chunk_idx].is_empty() {
-                        format!("{}#{}", relative_str, chunks[chunk_idx])
+                    let chunk_ref = if chunk_idx < chunk_data.len() && !chunk_data[chunk_idx].header.is_empty() {
+                        format!("{}#{}", relative_str, chunk_data[chunk_idx].header)
                     } else {
                         relative_str.clone()
                     };
@@ -352,14 +357,13 @@ pub fn build_graph(
                             "source": ner_model,
                         });
 
-                        let ent_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(&ent.label, EMBED_DIMS));
                         let _ = tx.execute(
                             "INSERT INTO nodes (label, type, metadata, embedding)
                              VALUES (?1, ?2, ?3, ?4)
                              ON CONFLICT(label) DO UPDATE SET
                                metadata = excluded.metadata,
                                embedding = excluded.embedding",
-                            rusqlite::params![ent.label, ent.type_, ent_metadata.to_string(), ent_emb],
+                            rusqlite::params![ent.label, ent.type_, ent_metadata.to_string(), None::<&[u8]>],
                         );
 
                         if let Ok(ent_node_id) = tx.query_row::<i64, _, _>(
@@ -399,10 +403,9 @@ pub fn build_graph(
 
                 // Relaciones estructurales: directorio
                 if !parent_dir.is_empty() && !skip_dirs.contains(&parent_dir.as_str()) {
-                    let dir_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(&parent_dir, EMBED_DIMS));
                     let _ = tx.execute(
                         "INSERT INTO nodes (label, type, embedding) VALUES (?1, 'tag', ?2) ON CONFLICT(label) DO UPDATE SET embedding = excluded.embedding",
-                        rusqlite::params![parent_dir, dir_emb],
+                        rusqlite::params![parent_dir, None::<&[u8]>],
                     );
                     if let Ok(dir_id) = tx.query_row::<i64, _, _>(
                         "SELECT id FROM nodes WHERE label = ?1",
@@ -419,10 +422,9 @@ pub fn build_graph(
 
                 // Relaciones estructurales: tags
                 for tag in &tags {
-                    let tag_emb = vector::vector_to_blob(&vector::synthetic::synthetic_embedding(tag, EMBED_DIMS));
                     let _ = tx.execute(
                         "INSERT INTO nodes (label, type, embedding) VALUES (?1, 'tag', ?2) ON CONFLICT(label) DO UPDATE SET embedding = excluded.embedding",
-                        rusqlite::params![tag, tag_emb],
+                        rusqlite::params![tag, None::<&[u8]>],
                     );
                     if let Ok(tag_id) = tx.query_row::<i64, _, _>(
                         "SELECT id FROM nodes WHERE label = ?1",
@@ -435,6 +437,14 @@ pub fn build_graph(
                             rusqlite::params![note_node_id, tag_id, relative_str],
                         );
                     }
+                }
+
+                // Insertar chunks embedidos en la tabla `chunks`
+                for cd in chunk_data {
+                    let _ = crate::db::chunks::insert_chunk(
+                        &tx, note_node_id, &cd.header, &cd.text, &cd.slug,
+                        Some(&cd.embedding_blob), None,
+                    );
                 }
 
                 // Commit de la transacción del archivo
@@ -452,7 +462,7 @@ pub fn build_graph(
                 }
 
                 pb.lock().unwrap().inc(1);
-                let msg = format!("{} ({} chunks, {} entidades)", relative_str, chunks.len(), all_entity_count);
+                let msg = format!("{} ({} chunks, {} entidades)", relative_str, chunk_data.len(), all_entity_count);
                 pb.lock().unwrap().set_message(msg);
                 debug!("  Commit OK. Nota '{}' procesada.", note_title);
             }
@@ -535,7 +545,8 @@ pub fn build_graph(
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "⚠️  Error en NER batch para {} (intento {}/3): {}",
+                                        "⚠️  Error en NER batch [model={}] para {} (intento {}/3): {}",
+                                        ner_model,
                                         relative_str,
                                         attempt,
                                         e
@@ -578,13 +589,58 @@ pub fn build_graph(
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_default();
 
+                    // Batch embed chunks via Ollama
+                    let chunk_data: Vec<ChunkData> = {
+                        if chunks.is_empty() {
+                            Vec::new()
+                        } else {
+                            let embed_texts: Vec<String> = chunks
+                                .iter()
+                                .map(|c| format!("{}\n{}", c.header, c.text))
+                                .collect();
+                            let embed_refs: Vec<&str> =
+                                embed_texts.iter().map(|s| s.as_str()).collect();
+
+                            let ollama = OllamaClient::new(ollama_url, embed_model);
+                            match ollama.batch_embed(&embed_refs) {
+                                Ok(embs) => chunks
+                                    .iter()
+                                    .zip(embs.iter())
+                                    .map(|(chunk, emb)| {
+                                        let slug =
+                                            slugify(&chunk.text.chars().take(80).collect::<String>());
+                                        ChunkData {
+                                            header: chunk.header.clone(),
+                                            text: chunk.text.clone(),
+                                            slug,
+                                            embedding_blob: vector::vector_to_blob(emb),
+                                        }
+                                    })
+                                    .collect(),
+                                Err(e) => {
+                                    log::warn!(
+                                        "⚠️  Ollama embedding failed for {} (model '{}' at {}): {}. \
+                                         File processed without chunk embeddings — vector search \
+                                         for this file's content will not work until embeddings \
+                                         are available.",
+                                        relative_str,
+                                        embed_model,
+                                        ollama_url,
+                                        e
+                                    );
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    };
+
                     // Enviar al writer
                     let result = FileResult {
                         relative_str: relative_str.to_string(),
                         note_title,
                         note_metadata: note_metadata.to_string(),
                         batch_entities,
-                        chunks: chunks.iter().map(|c| c.header.clone()).collect(),
+                        chunk_data,
                         parent_dir,
                         tags,
                     };

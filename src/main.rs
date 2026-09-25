@@ -1,4 +1,5 @@
 mod chunking;
+mod community;
 mod config;
 mod db;
 mod embed;
@@ -13,7 +14,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use log::debug;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// GraphRAG — Motor de búsqueda híbrida con vectores + grafos de conocimiento
 ///
@@ -59,6 +60,7 @@ enum Commands {
     /// Búsqueda híbrida (vectores + grafos)
     Search {
         /// Consulta de búsqueda
+        #[arg(allow_hyphen_values = true)]
         query: String,
         /// Ruta a la base de datos
         #[arg(default_value = "graphrag.db")]
@@ -72,24 +74,25 @@ enum Commands {
         /// Peso de la componente vectorial (0.0-1.0)
         #[arg(short, long, default_value = "0.7")]
         alpha: f64,
-        /// Usar Ollama para embeddings (si no, sintéticos)
-        #[arg(long)]
-        ollama: bool,
         /// URL de Ollama
         #[arg(long, default_value = "http://localhost:11434")]
         ollama_url: String,
         /// Modelo de embeddings
         #[arg(long, default_value = "nomic-embed-text")]
         embed_model: String,
-        /// Solo vectorial (sin grafo)
-        #[arg(long)]
-        vector_only: bool,
         /// Peso mínimo de arista para expansión
         #[arg(long)]
         min_weight: Option<f64>,
         /// Solo notas (sin entidades ni tags)
         #[arg(long)]
         notes_only: bool,
+        /// Filtrar por campo de metadatos (repeatable). Formato: 'campo operador valor',
+        /// e.g., 'date >= 2023', 'category = tutorial'
+        #[arg(long = "filter", value_name = "EXPR")]
+        filter: Vec<String>,
+        /// Generate a narrative answer using community context (requires 'community detect' + 'community summarize' first)
+        #[arg(long)]
+        answer: bool,
     },
     /// Búsqueda solo por grafo desde un nodo
     Graph {
@@ -105,6 +108,7 @@ enum Commands {
     /// Búsqueda textual exacta (FTS5)
     Fts {
         /// Consulta de búsqueda
+        #[arg(allow_hyphen_values = true)]
         query: String,
         /// Ruta a la base de datos
         #[arg(default_value = "graphrag.db")]
@@ -112,6 +116,9 @@ enum Commands {
         /// Número de resultados
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Mostrar solo notas (ocultar entidades y tags)
+        #[arg(long)]
+        notes_only: bool,
     },
     /// Camino más corto entre dos nodos
     Path {
@@ -131,6 +138,12 @@ enum Commands {
         /// Ruta a la base de datos
         #[arg(default_value = "graphrag.db")]
         db: String,
+        /// URL de Ollama
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        /// Modelo de embeddings
+        #[arg(long, default_value = "nomic-embed-text")]
+        embed_model: String,
     },
     /// Borra la base de datos y la recrea vacía
     Reset {
@@ -155,10 +168,43 @@ enum Commands {
         /// Ruta a la base de datos
         db: Option<String>,
     },
+    /// Community detection and summarization
+    Community {
+        #[command(subcommand)]
+        action: CommunityCommands,
+    },
     /// Genera scripts de autocompletado para el shell
     Completions {
         /// Shell para el que generar el script
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommunityCommands {
+    /// Run Leiden community detection on the entity graph
+    Detect {
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
+        /// Resolution parameter for CPM quality function (default: 1.0)
+        #[arg(long, default_value = "1.0")]
+        resolution: f64,
+    },
+    /// Generate LLM summaries for all communities
+    Summarize {
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
+        /// URL de Ollama
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        /// Modelo para generación de resúmenes
+        #[arg(long, default_value = "llama3.2:3b")]
+        summary_model: String,
+        /// Modelo de embeddings
+        #[arg(long, default_value = "nomic-embed-text")]
+        embed_model: String,
     },
 }
 
@@ -242,12 +288,12 @@ fn main() -> Result<()> {
             k,
             depth,
             alpha,
-            ollama,
             ollama_url,
             embed_model,
-            vector_only,
             min_weight,
             notes_only,
+            filter,
+            answer,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let k = if k == 5 { cfg.k } else { k };
@@ -277,12 +323,12 @@ fn main() -> Result<()> {
                 k,
                 depth,
                 alpha_val,
-                ollama,
                 ollama_url,
                 embed_model,
-                vector_only,
                 min_weight,
                 notes_only,
+                &filter,
+                answer,
             )
         }
         Commands::Graph { label, db, depth } => {
@@ -291,10 +337,18 @@ fn main() -> Result<()> {
             debug!("Comando: graph label='{}', depth={}", label, depth);
             cmd_graph(&label, db, depth)
         }
-        Commands::Fts { query, db, limit } => {
+        Commands::Fts {
+            query,
+            db,
+            limit,
+            notes_only,
+        } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
-            debug!("Comando: fts query='{}', limit={}", query, limit);
-            cmd_fts(&query, db, limit)
+            debug!(
+                "Comando: fts query='{}', limit={}, notes_only={}",
+                query, limit, notes_only
+            );
+            cmd_fts(&query, db, limit, notes_only)
         }
         Commands::Path {
             from,
@@ -306,10 +360,24 @@ fn main() -> Result<()> {
             debug!("Comando: path from='{}', to='{}'", from, to);
             cmd_path(&from, &to, db, max_depth)
         }
-        Commands::Seed { db } => {
+        Commands::Seed {
+            db,
+            ollama_url,
+            embed_model,
+        } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
+            let ollama_url = if ollama_url == "http://localhost:11434" {
+                &cfg.ollama_url
+            } else {
+                &ollama_url
+            };
+            let embed_model = if embed_model == "nomic-embed-text" {
+                &cfg.embed_model
+            } else {
+                &embed_model
+            };
             debug!("Comando: seed db={}", db);
-            cmd_seed(db)
+            cmd_seed(db, ollama_url, embed_model)
         }
         Commands::Reset { db } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
@@ -339,6 +407,36 @@ fn main() -> Result<()> {
             debug!("Comando: stats db={}", db.as_deref().unwrap_or(&cfg.db));
             cmd_stats(db.as_deref().unwrap_or(&cfg.db))
         }
+        Commands::Community { action } => match action {
+            CommunityCommands::Detect { db, resolution } => {
+                let db = if db == "graphrag.db" { &cfg.db } else { &db };
+                cmd_community_detect(db, resolution)
+            }
+            CommunityCommands::Summarize {
+                db,
+                ollama_url,
+                summary_model,
+                embed_model,
+            } => {
+                let db = if db == "graphrag.db" { &cfg.db } else { &db };
+                let ollama_url = if ollama_url == "http://localhost:11434" {
+                    &cfg.ollama_url
+                } else {
+                    &ollama_url
+                };
+                let summary_model = if summary_model == "llama3.2:3b" {
+                    &cfg.summary_model
+                } else {
+                    &summary_model
+                };
+                let embed_model = if embed_model == "nomic-embed-text" {
+                    &cfg.embed_model
+                } else {
+                    &embed_model
+                };
+                cmd_community_summarize(db, ollama_url, summary_model, embed_model)
+            }
+        },
         Commands::Completions { shell } => {
             debug!("Comando: completions shell={:?}", shell);
             cmd_completions(shell)
@@ -372,22 +470,36 @@ fn cmd_init(db: &str) -> Result<()> {
 fn cmd_neovim(output: Option<String>, cfg: &config::GraphRagConfig) -> Result<()> {
     let lua = format!(
         "-- GraphRAG.nvim -- Auto-generated by `graphrag init neovim`\n\
-         -- Install with lazy.nvim:\n\
-         --   {{ \"graphrag.nvim\", config = true }}\n\
+         -- Place in ~/.config/nvim/lua/plugins/graphrag.lua\n\
+         return {{\n\
+            dir = vim.fn.stdpath(\"config\") .. \"/lua/graphrag.nvim\",\n\
+            cmd = \"GraphRAG\",\n\
+            keys = {{\n\
+               {{ \",gr\", desc = \"GraphRAG: related notes\" }},\n\
+               {{ \",gi\", desc = \"GraphRAG: insert related links\" }},\n\
+           }},\n\
+           config = function()\n\
+             local db = \"{}\"\n\
+             local bin = \"graphrag\"\n\
+             local k = {}\n\
+             local depth = {}\n\
+             local notes_dir = \"{}\"\n\
          \n\
-         local M = {{}}\n\
-         \n\
-         function M.setup(opts)\n\
-             opts = opts or {{}}\n\
-             local db = opts.db or \"{}\"\n\
-             local bin = opts.bin or \"graphrag\"\n\
-             local k = opts.k or {}\n\
-             local depth = opts.depth or {}\n\
-             local notes_dir = opts.notes_dir or \"{}\"\n\
+             -- Helper: get visually selected text\n\
+             local function get_visual_selection()\n\
+                 local start_pos = vim.fn.getpos(\"'<\")\n\
+                 local end_pos = vim.fn.getpos(\"'>\")\n\
+                 if start_pos[1] == 0 or end_pos[1] == 0 then return \"\" end\n\
+                 local lines = vim.api.nvim_buf_get_lines(0, start_pos[2] - 1, end_pos[2], false)\n\
+                 if #lines == 0 then return \"\" end\n\
+                 lines[#lines] = string.sub(lines[#lines], 1, end_pos[3])\n\
+                 lines[1] = string.sub(lines[1], start_pos[3])\n\
+                 return table.concat(lines, \"\\n\")\n\
+             end\n\
          \n\
              -- Helper: run graphrag command and show results in a floating window\n\
-             local function run_graphrag(cmd, title)\n\
-                 local output = vim.fn.system({{ bin }} .. \" \" .. cmd)\n\
+             local function run_graphrag(args, title)\n\
+                 local output = vim.fn.system(args)\n\
                  if vim.v.shell_error ~= 0 then\n\
                      vim.notify(\"GraphRAG: \" .. output, vim.log.levels.ERROR)\n\
                      return\n\
@@ -407,7 +519,7 @@ fn cmd_neovim(output: Option<String>, cfg: &config::GraphRagConfig) -> Result<()
                  vim.api.nvim_buf_set_keymap(buf, \"n\", \"<CR>\", \":lua open_file()<CR>\", {{ noremap = true, silent = true }})\n\
              end\n\
          \n\
-             -- GraphRAG related: search notes related to current buffer\n\
+             -- Commands\n\
              vim.api.nvim_create_user_command(\"GraphRAG\", function(info)\n\
                  local args = info.args\n\
                  if args == \"\" then\n\
@@ -416,11 +528,13 @@ fn cmd_neovim(output: Option<String>, cfg: &config::GraphRagConfig) -> Result<()
                  end\n\
                  local sub, rest = args:match(\"^(%S+)%s*(.*)$\")\n\
                  if sub == \"related\" then\n\
-                     local title = vim.fn.expand(\"%:t:r\")\n\
-                     run_graphrag(string.format('search \"%s\" --db %s -k %d -d %d', title, db, k, depth), \"Related: \" .. title)\n\
+                     local content = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
+                     local query = table.concat(content, \"\\n\")\n\
+                     run_graphrag({{ bin, \"search\", query, db, \"-k\", tostring(k), \"-d\", tostring(depth), \"--notes-only\" }}, \"Related\")\n\
                  elseif sub == \"insert\" then\n\
-                     local title = vim.fn.expand(\"%:t:r\")\n\
-                     local result = vim.fn.system({{ bin, \"search\", title, \"--db\", db, \"-k\", tostring(k), \"-d\", tostring(depth) }})\n\
+                     local content = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
+                     local query = table.concat(content, \"\\n\")\n\
+                     local result = vim.fn.system({{ bin, \"search\", query, db, \"-k\", tostring(k), \"-d\", tostring(depth), \"--notes-only\" }})\n\
                      if vim.v.shell_error ~= 0 then\n\
                          vim.notify(\"GraphRAG: \" .. result, vim.log.levels.ERROR)\n\
                          return\n\
@@ -439,19 +553,33 @@ fn cmd_neovim(output: Option<String>, cfg: &config::GraphRagConfig) -> Result<()
                      else\n\
                          vim.notify(\"No se encontraron relacionados\", vim.log.levels.INFO)\n\
                      end\n\
+                 elseif sub == \"sel\" then\n\
+                     local query = get_visual_selection()\n\
+                     if query == \"\" then\n\
+                         vim.notify(\"No text selected. Select text in visual mode first.\", vim.log.levels.WARN)\n\
+                         return\n\
+                     end\n\
+                     run_graphrag({{ bin, \"search\", query, db, \"-k\", tostring(k), \"-d\", tostring(depth), \"--notes-only\" }}, \"Selection\")\n\
+                 elseif sub == \"ftsel\" then\n\
+                     local query = get_visual_selection()\n\
+                     if query == \"\" then\n\
+                         vim.notify(\"No text selected. Select text in visual mode first.\", vim.log.levels.WARN)\n\
+                         return\n\
+                     end\n\
+                     run_graphrag({{ bin, \"fts\", query, db, \"-l\", tostring(k), \"--notes-only\" }}, \"FTS Selection\")\n\
                  elseif sub == \"search\" then\n\
-                     run_graphrag(string.format('search \"%s\" --db %s -k %d -d %d', rest, db, k, depth), \"Search\")\n\
+                     run_graphrag({{ bin, \"search\", rest, db, \"-k\", tostring(k), \"-d\", tostring(depth) }}, \"Search\")\n\
                  elseif sub == \"fts\" then\n\
-                     run_graphrag(string.format('fts \"%s\" --db %s -l %d', rest, db, k), \"FTS\")\n\
+                     run_graphrag({{ bin, \"fts\", rest, db, \"-l\", tostring(k) }}, \"FTS\")\n\
                  elseif sub == \"path\" then\n\
                      local from, to = rest:match(\"^(%S+)%s+(%S+)$\")\n\
                      if from and to then\n\
-                         run_graphrag(string.format('path \"%s\" \"%s\" --db %s', from, to, db), \"Path\")\n\
+                         run_graphrag({{ bin, \"path\", from, to, db }}, \"Path\")\n\
                      else\n\
                          vim.notify(\"Usage: :GraphRAG path <from> <to>\", vim.log.levels.WARN)\n\
                      end\n\
                  elseif sub == \"stats\" then\n\
-                     run_graphrag(string.format(\"stats --db %s\", db), \"Stats\")\n\
+                     run_graphrag({{ bin, \"stats\", db }}, \"Stats\")\n\
                  else\n\
                      vim.notify(\"Unknown subcommand: \" .. sub, vim.log.levels.WARN)\n\
                  end\n\
@@ -460,16 +588,23 @@ fn cmd_neovim(output: Option<String>, cfg: &config::GraphRagConfig) -> Result<()
              -- Keymaps\n\
              vim.keymap.set(\"n\", \",gr\", \":GraphRAG related<CR>\", {{ noremap = true, silent = true, desc = \"GraphRAG: related notes\" }})\n\
              vim.keymap.set(\"n\", \",gi\", \":GraphRAG insert<CR>\", {{ noremap = true, silent = true, desc = \"GraphRAG: insert related links\" }})\n\
-         end\n\
-         \n\
-         return M\n",
+           end,\n\
+         }}\n",
         cfg.db, cfg.k, cfg.depth, cfg.notes_dir
     );
 
     match output {
         Some(path) => {
             std::fs::write(&path, &lua)?;
+            // Create the plugin directory that dir points to
+            let plugin_dir = dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("~/.config"))
+                .join("nvim")
+                .join("lua")
+                .join("graphrag.nvim");
+            std::fs::create_dir_all(&plugin_dir)?;
             println!("✅ Configuración NeoVim escrita en: {}", path);
+            println!("   Directorio plugin creado: {}", plugin_dir.display());
         }
         None => {
             println!("{}", lua);
@@ -530,9 +665,9 @@ fn cmd_build(
     // Verificar modelo NER
     let ner_check = embed::ollama::OllamaClient::new(ollama_url, ner_model);
     if let Err(e) = ner_check.health_check() {
-        eprintln!("⚠️  Modelo NER '{}' no encontrado: {}", ner_model, e);
-        eprintln!("⚠️  El build continuará pero NO se extraerán entidades.");
-        eprintln!("💡  Para extraer entidades: ollama pull {}", ner_model);
+        eprintln!("❌ Modelo NER '{}' no encontrado: {}", ner_model, e);
+        eprintln!("❌ El build continuará pero NO se extraerán entidades.");
+        eprintln!("💡 Solución: ollama pull {}", ner_model);
     }
 
     let stats =
@@ -541,49 +676,52 @@ fn cmd_build(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: &str,
     db: &str,
     k: usize,
     depth: i32,
     alpha: f64,
-    use_ollama: bool,
     ollama_url: &str,
     embed_model: &str,
-    vector_only: bool,
     min_weight: Option<f64>,
     notes_only: bool,
+    filter: &[String],
+    answer: bool,
 ) -> Result<()> {
-    let ollama = if use_ollama {
-        Some(embed::ollama::OllamaClient::new(ollama_url, embed_model))
-    } else {
-        None
-    };
+    // Parse filters (fail early on invalid syntax)
+    let filters: Vec<search::filter::Filter> = filter
+        .iter()
+        .map(|f| search::filter::parse_filter(f))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|e| {
+            eprintln!("❌ {}", e);
+            e
+        })?;
 
-    let mut hs = search::HybridSearch::new(db, ollama)?;
+    let ollama = embed::ollama::OllamaClient::new(ollama_url, embed_model);
+    let mut hs = search::HybridSearch::new(db, ollama.clone())?;
 
     println!("\n🔍 Consulta: '{}'", query);
-    println!(
-        "   k={}, depth={}, alpha={}, embed={}",
-        k,
-        depth,
-        alpha,
-        if use_ollama { "Ollama" } else { "sintético" }
-    );
+    println!("   k={}, depth={}, alpha={}", k, depth, alpha,);
     if let Some(mw) = min_weight {
         println!("   min_weight={}", mw);
     }
     if notes_only {
         println!("   solo notas");
     }
+    if !filters.is_empty() {
+        println!("   filtros:");
+        for f in &filters {
+            println!("     {} {} {}", f.field, f.operator, f.value);
+        }
+    }
     println!();
 
-    let results = if vector_only {
-        println!("📊 RAG VECTORIAL PURO (depth=0)\n{}", "─".repeat(50));
-        hs.vector_only(query, k)?
-    } else {
+    let results = {
         println!("🧠 HYBRID SEARCH (depth={})\n{}", depth, "─".repeat(50));
-        hs.hybrid_search(query, k, depth, alpha, min_weight, notes_only)?
+        hs.hybrid_search(query, k, depth, alpha, min_weight, notes_only, &filters)?
     };
 
     if results.is_empty() {
@@ -602,6 +740,9 @@ fn cmd_search(
             "   {:>10.3}  [{:8}] {}{}  (vecinos: {})",
             r.score, r.r#type, r.label, file_info, n_count
         );
+        if !r.chunk_header.is_empty() {
+            println!("   └── {}: {}", r.chunk_header, r.content);
+        }
     }
 
     // Mostrar vecinos del primer resultado
@@ -615,11 +756,117 @@ fn cmd_search(
         }
     }
 
+    // ── Mostrar comunidades relacionadas ──
+    {
+        let conn = rusqlite::Connection::open(db)?;
+        match crate::db::communities::load_all_community_embeddings(&conn) {
+            Ok(embeddings) if !embeddings.is_empty() => {
+                if let Ok(query_vec) = ollama.embed(query) {
+                    let mut community_sims: Vec<(f64, &str, &str)> = embeddings
+                        .iter()
+                        .map(|(_, emb, label, summary)| {
+                            let sim = crate::vector::cosine_similarity_raw(emb, &query_vec) as f64;
+                            (sim, label.as_str(), summary.as_str())
+                        })
+                        .collect();
+                    community_sims
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+                    println!("\n🏘️  Comunidades relacionadas:");
+                    println!("{}", "─".repeat(50));
+                    for (sim, label, summary) in community_sims.iter().take(2) {
+                        let preview: String = summary.chars().take(120).collect();
+                        println!("   [{:.3}] {}: {}", sim, label, preview);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Modo respuesta ──
+    if answer {
+        let conn = rusqlite::Connection::open(db)?;
+        let community_embeddings =
+            crate::db::communities::load_all_community_embeddings(&conn).unwrap_or_default();
+
+        println!("\n🧠 GENERANDO RESPUESTA...\n{}", "─".repeat(50));
+        match crate::community::search::answer_query(
+            &ollama,
+            query,
+            &results,
+            &community_embeddings,
+            embed_model,
+        ) {
+            Ok(answer_text) => {
+                println!("{}", answer_text);
+            }
+            Err(e) => {
+                eprintln!("❌ Error generando respuesta: {}", e);
+            }
+        }
+    }
+
     Ok(())
 }
 
+fn cmd_community_detect(db: &str, resolution: f64) -> Result<()> {
+    println!(
+        "🔬 Detectando comunidades (Leiden, resolution={})...",
+        resolution
+    );
+    match crate::community::detect::run_community_detection(db, resolution) {
+        Ok((level1, level2)) => {
+            println!("✅ Comunidades detectadas:");
+            println!("   Nivel 1 (gruesas): {}", level1);
+            println!("   Nivel 2 (finas):   {}", level2);
+            println!(
+                "\n💡 Ejecuta 'graphrag community summarize {}' para generar resúmenes",
+                db
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("❌ Error detectando comunidades: {}", e);
+            Ok(())
+        }
+    }
+}
+
+fn cmd_community_summarize(
+    db: &str,
+    ollama_url: &str,
+    summary_model: &str,
+    embed_model: &str,
+) -> Result<()> {
+    println!("📝 Resumiendo comunidades con '{}'...", summary_model);
+    match crate::community::summarize::summarize_all_communities(
+        db,
+        ollama_url,
+        summary_model,
+        embed_model,
+    ) {
+        Ok((count, tokens)) => {
+            if count == 0 {
+                println!("   (todas las comunidades ya tienen resumen)");
+            } else {
+                println!(
+                    "✅ {} comunidades resumidas ({} tokens totales)",
+                    count, tokens
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("❌ Error resumiendo comunidades: {}", e);
+            Ok(())
+        }
+    }
+}
+
 fn cmd_graph(label: &str, db: &str, depth: i32) -> Result<()> {
-    let hs = search::HybridSearch::new(db, None)?;
+    let ollama = embed::ollama::OllamaClient::new("http://localhost:11434", "nomic-embed-text");
+    let hs = search::HybridSearch::new(db, ollama)?;
 
     let neighbors = match hs.graph_only(label, depth) {
         Ok(n) => n,
@@ -644,13 +891,17 @@ fn cmd_graph(label: &str, db: &str, depth: i32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_fts(query: &str, db: &str, limit: usize) -> Result<()> {
-    let hs = search::HybridSearch::new(db, None)?;
+fn cmd_fts(query: &str, db: &str, limit: usize, notes_only: bool) -> Result<()> {
+    let ollama = embed::ollama::OllamaClient::new("http://localhost:11434", "nomic-embed-text");
+    let hs = search::HybridSearch::new(db, ollama)?;
 
     println!("📄 BÚSQUEDA FTS5: '{}'", query);
+    if notes_only {
+        println!("   (solo notas)");
+    }
     println!("{}", "─".repeat(50));
 
-    let results = hs.fts_search(query, limit)?;
+    let results = hs.fts_search(query, limit, notes_only)?;
 
     if results.is_empty() {
         println!("   (sin resultados)");
@@ -694,9 +945,9 @@ fn cmd_path(from: &str, to: &str, db: &str, max_depth: i32) -> Result<()> {
     Ok(())
 }
 
-fn cmd_seed(db: &str) -> Result<()> {
+fn cmd_seed(db: &str, ollama_url: &str, embed_model: &str) -> Result<()> {
     println!("🌱 Generando base de datos de demostración...");
-    seed::demo_data::create_demo_db(db)?;
+    seed::demo_data::create_demo_db(db, ollama_url, embed_model)?;
     println!("\n💡 Ejemplos de uso:");
     println!(
         "   graphrag search \"seguridad en contenedores\" --db {}",
@@ -713,7 +964,8 @@ fn cmd_seed(db: &str) -> Result<()> {
 }
 
 fn cmd_stats(db: &str) -> Result<()> {
-    let hs = search::HybridSearch::new(db, None)?;
+    let ollama = embed::ollama::OllamaClient::new("http://localhost:11434", "nomic-embed-text");
+    let hs = search::HybridSearch::new(db, ollama)?;
     let stats = hs.stats()?;
     println!("{}", stats);
     Ok(())

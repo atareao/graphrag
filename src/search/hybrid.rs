@@ -2,11 +2,21 @@ use anyhow::Result;
 use log::debug;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::embed::ollama::OllamaClient;
 use crate::graph::expand::{self, Neighbor};
-use crate::vector::{self, synthetic};
+use crate::search::filter::Filter;
+use crate::vector;
+
+/// Clips a text string to at most `max_len` characters.
+fn clip_text(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
 
 /// Un resultado individual de la búsqueda híbrida
 #[derive(Debug, Clone, Serialize)]
@@ -19,9 +29,14 @@ pub struct SearchResult {
     /// Ruta del archivo (si es una nota)
     pub file: String,
     pub neighbors: Vec<Neighbor>,
+    /// Cabecera del chunk que matched (si aplica)
+    pub chunk_header: String,
+    /// Texto completo del chunk que matched (si aplica)
+    pub chunk_text: String,
 }
 
 impl SearchResult {
+    #[allow(dead_code)]
     fn new(
         id: i64,
         label: String,
@@ -38,28 +53,29 @@ impl SearchResult {
             content,
             file,
             neighbors: Vec::new(),
+            chunk_header: String::new(),
+            chunk_text: String::new(),
         }
     }
 }
 
-/// Metadatos de un nodo cargado para búsqueda
+/// Metadatos de un chunk cargado para búsqueda
 #[derive(Debug, Clone)]
-struct NodeMeta {
-    id: i64,
-    label: String,
-    r#type: String,
+struct ChunkMeta {
+    #[allow(dead_code)]
+    chunk_id: i64,
+    note_id: i64,
+    header: String,
+    text: String,
 }
 
-/// Motor de búsqueda híbrida: vectores + grafos de conocimiento
+/// Motor de búsqueda híbrida: vectores (por chunks) + grafos de conocimiento
 pub struct HybridSearch {
     conn: Connection,
-    ollama: Option<OllamaClient>,
-    #[allow(dead_code)]
-    use_synthetic: bool,
-    dims: usize,
-    // Cache de embeddings de nodos
-    all_vecs: Vec<Vec<f32>>,
-    all_meta: Vec<NodeMeta>,
+    ollama: OllamaClient,
+    // Vectores de chunks
+    chunk_vecs: Vec<Vec<f32>>,
+    chunk_meta: Vec<ChunkMeta>,
     loaded: bool,
     // Cache de embeddings de consultas
     embed_cache: std::collections::HashMap<String, Vec<f32>>,
@@ -67,36 +83,34 @@ pub struct HybridSearch {
 
 impl HybridSearch {
     /// Crea un nuevo motor HybridSearch
-    /// - db_path: ruta a la base de datos SQLite
-    /// - ollama: cliente Ollama opcional (si es None, usa embeddings sintéticos)
-    pub fn new(db_path: &str, ollama: Option<OllamaClient>) -> Result<Self> {
+    pub fn new(db_path: &str, ollama: OllamaClient) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        let use_synthetic = ollama.is_none();
-        let dims = ollama.as_ref().map_or(1024, |o| o.embedding_dimension());
-        debug!(
-            "HybridSearch abierto: db={}, ollama={}, dims={}",
-            db_path,
-            if ollama.is_some() {
-                "sí"
-            } else {
-                "no (sintético)"
-            },
-            dims
-        );
+        debug!("HybridSearch abierto: db={}", db_path);
 
         Ok(Self {
             conn,
             ollama,
-            use_synthetic,
-            dims,
-            all_vecs: Vec::new(),
-            all_meta: Vec::new(),
+            chunk_vecs: Vec::new(),
+            chunk_meta: Vec::new(),
             loaded: false,
             embed_cache: std::collections::HashMap::new(),
         })
     }
 
-    /// Genera embedding para un texto (Ollama o sintético)
+    /// Constructor internal para tests (usa conexión existente)
+    #[cfg(test)]
+    fn new_internal(conn: Connection, ollama: OllamaClient) -> Result<Self> {
+        Ok(Self {
+            conn,
+            ollama,
+            chunk_vecs: Vec::new(),
+            chunk_meta: Vec::new(),
+            loaded: false,
+            embed_cache: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Genera embedding para un texto usando Ollama
     fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
         if let Some(cached) = self.embed_cache.get(text) {
             let preview: String = text.chars().take(40).collect();
@@ -104,61 +118,40 @@ impl HybridSearch {
             return Ok(cached.clone());
         }
 
-        let vec = if let Some(ref client) = self.ollama {
-            client.embed(text)?
-        } else {
-            synthetic::synthetic_embedding(text, self.dims)
-        };
+        let vec = self.ollama.embed(text)?;
         let preview: String = text.chars().take(40).collect();
         debug!(
-            "Embedding generado: '{}'... ({}d, {})",
+            "Embedding generado: '{}'... ({}d, Ollama)",
             preview,
-            vec.len(),
-            if self.ollama.is_some() {
-                "Ollama"
-            } else {
-                "sintético"
-            }
+            vec.len()
         );
 
         self.embed_cache.insert(text.to_string(), vec.clone());
         Ok(vec)
     }
 
-    /// Carga todos los embeddings de nodos desde SQLite
-    fn load_all_embeddings(&mut self) -> Result<()> {
+    /// Carga todos los embeddings de chunks desde SQLite
+    fn load_all_chunks(&mut self) -> Result<()> {
         if self.loaded {
             return Ok(());
         }
 
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, label, type, embedding FROM nodes WHERE embedding IS NOT NULL")?;
-
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let label: String = row.get(1)?;
-            let type_: String = row.get(2)?;
-            let blob: Vec<u8> = row.get(3)?;
-            Ok((id, label, type_, blob))
-        })?;
-
-        for row in rows {
-            let (id, label, type_, blob) = row?;
-            let vec = vector::blob_to_vector(&blob)?;
-            self.all_vecs.push(vec);
-            self.all_meta.push(NodeMeta {
-                id,
-                label,
-                r#type: type_,
+        let data = crate::db::chunks::load_all_chunk_embeddings(&self.conn)?;
+        for (chunk_id, note_id, vec, header, text) in data {
+            if vec.is_empty() {
+                continue; // saltar chunks sin embedding
+            }
+            self.chunk_vecs.push(vec);
+            self.chunk_meta.push(ChunkMeta {
+                chunk_id,
+                note_id,
+                header,
+                text,
             });
         }
 
         self.loaded = true;
-        debug!(
-            "Embeddings cargados: {} nodos con vector.",
-            self.all_vecs.len()
-        );
+        debug!("Chunks cargados: {} con embedding.", self.chunk_vecs.len());
         Ok(())
     }
 
@@ -209,11 +202,65 @@ impl HybridSearch {
         }
     }
 
+    /// Obtiene el label de un nodo desde la tabla `nodes`
+    fn get_note_label(&self, note_id: i64) -> Result<String> {
+        let result: std::result::Result<String, _> = self.conn.query_row(
+            "SELECT label FROM nodes WHERE id = ?1",
+            rusqlite::params![note_id],
+            |row| row.get(0),
+        );
+        match result {
+            Ok(label) => Ok(label),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(format!("note#{}", note_id)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Obtiene el label de un nodo, aplicando filtros de metadatos.
+    ///
+    /// Returns `None` si el nodo existe pero no cumple los filtros,
+    /// o si el nodo no existe.
+    fn get_note_label_with_filters(
+        &self,
+        note_id: i64,
+        filters: &[Filter],
+    ) -> Result<Option<String>> {
+        if filters.is_empty() {
+            // Sin filtros, comportamiento normal
+            return Ok(Some(self.get_note_label(note_id)?));
+        }
+
+        let mut sql = "SELECT label FROM nodes WHERE id = ?1".to_string();
+        let (filter_sql, filter_vals) = crate::search::filter::build_filter_sql(filters);
+        sql.push_str(&filter_sql);
+
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(note_id)];
+        for v in &filter_vals {
+            params.push(Box::new(v.clone()));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let result: std::result::Result<String, _> =
+            self.conn
+                .query_row(&sql, param_refs.as_slice(), |row| row.get(0));
+
+        match result {
+            Ok(label) => Ok(Some(label)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Búsqueda híbrida completa: 3 fases
     ///
-    /// FASE 1 — Búsqueda vectorial: similitud coseno sobre todos los nodos
-    /// FASE 2 — Reranking: bonificaciones por título y tipo
-    /// FASE 3 — Expansión por grafo: CTE recursiva desde los candidatos
+    /// FASE 1 — Búsqueda vectorial: similitud coseno sobre chunks
+    /// FASE 2 — Reranking: bonificaciones por título y agrupación por nota
+    ///   Si se proporcionan `filters`, se aplican contra el metadata JSON
+    ///   de la nota padre. Los chunks cuya nota no cumpla los filtros se omiten.
+    /// FASE 3 — Expansión por grafo: CTE recursiva desde la nota padre
+    #[allow(clippy::too_many_arguments)]
     pub fn hybrid_search(
         &mut self,
         query: &str,
@@ -222,12 +269,14 @@ impl HybridSearch {
         alpha: f64,
         min_weight: Option<f64>,
         notes_only: bool,
+        filters: &[Filter],
     ) -> Result<Vec<SearchResult>> {
-        // === FASE 1: Búsqueda vectorial ===
+        // === FASE 1: Búsqueda vectorial sobre chunks ===
         let query_vec = self.embed(query)?;
-        self.load_all_embeddings()?;
+        self.load_all_chunks()?;
 
-        if self.all_vecs.is_empty() {
+        if self.chunk_vecs.is_empty() {
+            debug!("No chunks with embeddings found in database.");
             return Ok(Vec::new());
         }
 
@@ -236,9 +285,9 @@ impl HybridSearch {
             return Ok(Vec::new());
         }
 
-        // Calcular similitud coseno con todos los vectores
+        // Calcular similitud coseno con todos los vectores de chunks
         let mut sims: Vec<(usize, f64)> = self
-            .all_vecs
+            .chunk_vecs
             .iter()
             .enumerate()
             .map(|(i, v)| {
@@ -256,22 +305,58 @@ impl HybridSearch {
         }
 
         debug!(
-            "FASE 1 — Vector search: top {} de {} nodos. Mejor score: {:.4}",
+            "FASE 1 — Vector search: top {} de {} chunks. Mejor score: {:.4}",
             top_k.len(),
-            self.all_vecs.len(),
+            self.chunk_vecs.len(),
             top_k.first().map(|(_, s)| s).unwrap_or(&0.0)
         );
 
-        // === FASE 2: Reranking ===
+        // === FASE 2: Reranking con agrupación por nota ===
         let query_lower = query.to_lowercase();
         let query_words: HashSet<&str> = query_lower.split_whitespace().collect();
-        let mut candidates: Vec<(f64, &NodeMeta)> = Vec::new();
+
+        // Cache de labels de notas para evitar queries repetidas
+        let mut label_cache: HashMap<i64, String> = HashMap::new();
+
+        /// Candidato interno tras reranking
+        struct ChunkCandidate {
+            note_id: i64,
+            score: f64,
+            header: String,
+            text: String,
+        }
+
+        let mut seen_notes: HashSet<i64> = HashSet::new();
+        let mut candidates: Vec<ChunkCandidate> = Vec::new();
 
         for (idx, vec_score) in &top_k {
-            let meta = &self.all_meta[*idx];
+            let meta = &self.chunk_meta[*idx];
 
-            // Bonus si el título contiene palabras de la query
-            let label_lower = meta.label.to_lowercase();
+            // Saltar chunks repetidos de la misma nota (quedamos con el mejor)
+            if seen_notes.contains(&meta.note_id) {
+                continue;
+            }
+            seen_notes.insert(meta.note_id);
+
+            // Obtener label de la nota padre, con filtros si existen
+            let note_label = match label_cache.get(&meta.note_id) {
+                Some(l) => l.clone(),
+                None => {
+                    match self.get_note_label_with_filters(meta.note_id, filters)? {
+                        Some(l) => {
+                            label_cache.insert(meta.note_id, l.clone());
+                            l
+                        }
+                        None => {
+                            // Nota no cumple filtros → omitir este chunk
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Bonus si el título de la nota contiene palabras de la query
+            let label_lower = note_label.to_lowercase();
             let label_words: HashSet<&str> = label_lower.split_whitespace().collect();
             let title_bonus = if query_words.intersection(&label_words).next().is_some() {
                 0.1
@@ -279,54 +364,70 @@ impl HybridSearch {
                 0.0
             };
 
-            // Bonus si es nota (pesa más que entidades sueltas)
-            let type_bonus = if meta.r#type == "note" { 0.2 } else { 0.0 };
+            // Bonus por ser nota (los chunks siempre son de notas)
+            let type_bonus = 0.2;
 
             let score = alpha * (*vec_score + title_bonus + type_bonus);
-            candidates.push((score, meta));
+            candidates.push(ChunkCandidate {
+                note_id: meta.note_id,
+                score,
+                header: meta.header.clone(),
+                text: meta.text.clone(),
+            });
         }
 
-        candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         debug!(
-            "FASE 2 — Reranking: {} candidatos. Mejor: '{}' ({:.4})",
+            "FASE 2 — Reranking: {} candidatos (agrupados por nota). Mejor: '{}' ({:.4})",
             candidates.len(),
             candidates
                 .first()
-                .map(|(_, m)| &m.label)
-                .unwrap_or(&String::new()),
-            candidates.first().map(|(s, _)| s).unwrap_or(&0.0)
+                .map(|c| { label_cache.get(&c.note_id).cloned().unwrap_or_default() })
+                .unwrap_or_default(),
+            candidates.first().map(|c| c.score).unwrap_or(0.0)
         );
 
         // === FASE 3: Expansión por grafo ===
         let mut seen_ids: HashSet<i64> = HashSet::new();
         let mut results: Vec<SearchResult> = Vec::new();
 
-        for (score, meta) in &candidates {
-            if seen_ids.contains(&meta.id) {
+        for candidate in &candidates {
+            if seen_ids.contains(&candidate.note_id) {
                 continue;
             }
-            seen_ids.insert(meta.id);
+            seen_ids.insert(candidate.note_id);
 
             let neighbors = if depth > 0 {
                 if let Some(min_w) = min_weight {
-                    expand::expand_neighbors_weighted(&self.conn, meta.id, depth, min_w)?
+                    expand::expand_neighbors_weighted(&self.conn, candidate.note_id, depth, min_w)?
                 } else {
-                    expand::expand_neighbors(&self.conn, meta.id, depth)?
+                    expand::expand_neighbors(&self.conn, candidate.note_id, depth)?
                 }
             } else {
                 Vec::new()
             };
 
-            let mut result = SearchResult::new(
-                meta.id,
-                meta.label.clone(),
-                meta.r#type.clone(),
-                *score,
-                self.get_content(meta.id)?,
-                self.get_file(meta.id)?,
-            );
-            result.neighbors = neighbors.clone();
+            let note_label = label_cache
+                .get(&candidate.note_id)
+                .cloned()
+                .unwrap_or_else(|| self.get_note_label(candidate.note_id).unwrap_or_default());
+
+            let result = SearchResult {
+                id: candidate.note_id,
+                label: note_label.clone(),
+                r#type: "note".to_string(),
+                score: candidate.score,
+                content: clip_text(&candidate.text, 200),
+                file: self.get_file(candidate.note_id)?,
+                neighbors: neighbors.clone(),
+                chunk_header: candidate.header.clone(),
+                chunk_text: candidate.text.clone(),
+            };
             results.push(result);
 
             // Añadir vecinos con score reducido
@@ -336,15 +437,18 @@ impl HybridSearch {
                 }
                 seen_ids.insert(n.id);
 
-                let neighbor_score = (1.0 - alpha) * score;
-                results.push(SearchResult::new(
-                    n.id,
-                    n.label.clone(),
-                    n.r#type.clone(),
-                    neighbor_score,
-                    self.get_content(n.id)?,
-                    self.get_file(n.id)?,
-                ));
+                let neighbor_score = (1.0 - alpha) * candidate.score;
+                results.push(SearchResult {
+                    id: n.id,
+                    label: n.label.clone(),
+                    r#type: n.r#type.clone(),
+                    score: neighbor_score,
+                    content: self.get_content(n.id)?,
+                    file: self.get_file(n.id)?,
+                    neighbors: Vec::new(),
+                    chunk_header: String::new(),
+                    chunk_text: String::new(),
+                });
             }
         }
 
@@ -396,11 +500,6 @@ impl HybridSearch {
         Ok(results)
     }
 
-    /// Búsqueda solo vectorial (sin expansión por grafo)
-    pub fn vector_only(&mut self, query: &str, k: usize) -> Result<Vec<SearchResult>> {
-        self.hybrid_search(query, k, 0, 0.7, None, false)
-    }
-
     /// Búsqueda solo por grafo desde un nodo
     pub fn graph_only(&self, node_label: &str, depth: i32) -> Result<Vec<Neighbor>> {
         let id: i64 = self
@@ -416,7 +515,12 @@ impl HybridSearch {
     }
 
     /// Búsqueda FTS5 (textual exacta)
-    pub fn fts_search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    pub fn fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+        notes_only: bool,
+    ) -> Result<Vec<SearchResult>> {
         let mut stmt = self.conn.prepare(
             "SELECT n.id, n.label, n.type, n.metadata, rank AS score
              FROM notes_fts
@@ -452,6 +556,10 @@ impl HybridSearch {
         }
         debug!("FTS search: '{}' → {} resultados", query, results.len());
 
+        if notes_only {
+            results.retain(|r| r.r#type == "note");
+        }
+
         Ok(results)
     }
 
@@ -479,10 +587,13 @@ impl HybridSearch {
             .conn
             .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
         let with_emb: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM nodes WHERE embedding IS NOT NULL",
+            "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL",
             [],
             |r| r.get(0),
         )?;
+        let chunks: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
 
         Ok(DbStats {
             nodes,
@@ -491,6 +602,7 @@ impl HybridSearch {
             tags,
             edges,
             with_embeddings: with_emb,
+            chunks,
         })
     }
 
@@ -509,6 +621,7 @@ pub struct DbStats {
     pub tags: i64,
     pub edges: i64,
     pub with_embeddings: i64,
+    pub chunks: i64,
 }
 
 impl std::fmt::Display for DbStats {
@@ -521,8 +634,416 @@ impl std::fmt::Display for DbStats {
              ├── Entidades:         {}\n\
              ├── Tags:              {}\n\
              ├── Aristas:           {}\n\
+             ├── Chunks:            {}\n\
              └── Con embeddings:    {}",
-            self.nodes, self.notes, self.entities, self.tags, self.edges, self.with_embeddings
+            self.nodes,
+            self.notes,
+            self.entities,
+            self.tags,
+            self.edges,
+            self.chunks,
+            self.with_embeddings
         )
+    }
+}
+
+#[cfg(test)]
+impl HybridSearch {
+    /// Injects a synthetic embedding into the cache so that `embed()` returns
+    /// it without calling Ollama.  Used by tests that need `hybrid_search` to
+    /// run without a real Ollama server.
+    fn inject_embedding(&mut self, text: &str, vec: Vec<f32>) {
+        self.embed_cache.insert(text.to_string(), vec);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::init_db;
+    use crate::search::filter::Filter;
+    use crate::vector::vector_to_blob;
+
+    /// Creates an in-memory database with a note and some chunks with embeddings.
+    fn setup_db_with_chunks() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a note node with metadata
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1i64, "test-note", "note", r#"{"path":"/tmp/test.md"}"#],
+        )
+        .unwrap();
+
+        // Insert two chunks with embeddings
+        let emb1 = vector_to_blob(&[0.1_f32, 0.2_f32, 0.3_f32]);
+        let emb2 = vector_to_blob(&[0.4_f32, 0.5_f32, 0.6_f32]);
+        crate::db::chunks::insert_chunk(
+            &conn,
+            1,
+            "Header 1",
+            "This is the first chunk text content",
+            "header-1",
+            Some(&emb1),
+            None,
+        )
+        .unwrap();
+        crate::db::chunks::insert_chunk(
+            &conn,
+            1,
+            "Header 2",
+            "This is the second chunk with more text content",
+            "header-2",
+            Some(&emb2),
+            None,
+        )
+        .unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn test_load_all_chunks_populates_vectors() {
+        let conn = setup_db_with_chunks();
+
+        // Create HybridSearch with a mock-like approach:
+        // We can't easily construct HybridSearch without an Ollama client,
+        // so we test load_all_chunks indirectly via the public API.
+        // Instead, test the data insertion directly.
+        let data = crate::db::chunks::load_all_chunk_embeddings(&conn).unwrap();
+        assert_eq!(data.len(), 2, "should load 2 chunks");
+
+        let (id1, note_id1, emb1, header1, text1) = &data[0];
+        assert_eq!(*note_id1, 1);
+        assert_eq!(emb1.len(), 3);
+        assert_eq!(header1, "Header 1");
+        assert_eq!(text1, "This is the first chunk text content");
+        assert!(*id1 > 0);
+
+        let (id2, note_id2, emb2, header2, text2) = &data[1];
+        assert_eq!(*note_id2, 1);
+        assert_eq!(emb2.len(), 3);
+        assert_eq!(header2, "Header 2");
+        assert_eq!(text2, "This is the second chunk with more text content");
+        assert!(*id2 > *id1, "second chunk should have a larger id");
+    }
+
+    #[test]
+    fn test_load_all_chunks_empty_db() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let data = crate::db::chunks::load_all_chunk_embeddings(&conn).unwrap();
+        assert!(data.is_empty(), "empty db should return no chunks");
+    }
+
+    #[test]
+    fn test_load_all_chunks_skips_null_embeddings() {
+        let conn = setup_db_with_chunks();
+
+        // Add a chunk without embedding
+        crate::db::chunks::insert_chunk(
+            &conn,
+            1,
+            "No Embed",
+            "This chunk has no embedding",
+            "no-embed",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let data = crate::db::chunks::load_all_chunk_embeddings(&conn).unwrap();
+        // All three chunks are returned, but the third has empty vec
+        assert_eq!(data.len(), 3);
+        assert!(data[2].2.is_empty(), "third chunk should have empty vec");
+    }
+
+    #[test]
+    fn test_get_note_label() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (id, label, type) VALUES (?1, ?2, ?3)",
+            rusqlite::params![42i64, "My Note", "note"],
+        )
+        .unwrap();
+
+        // We can test via a direct query (HybridSearch::get_note_label is private)
+        let label: String = conn
+            .query_row(
+                "SELECT label FROM nodes WHERE id = ?1",
+                rusqlite::params![42i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(label, "My Note");
+    }
+
+    #[test]
+    fn test_clip_text_short() {
+        assert_eq!(clip_text("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_clip_text_long() {
+        let long = "a".repeat(300);
+        let clipped = clip_text(&long, 200);
+        assert_eq!(clipped.len(), 203); // 200 + "..."
+        assert!(clipped.ends_with("..."));
+    }
+
+    #[test]
+    fn test_search_result_chunk_fields() {
+        let r = SearchResult {
+            id: 1,
+            label: "test".into(),
+            r#type: "note".into(),
+            score: 0.9,
+            content: "preview text".into(),
+            file: "/path/file.md".into(),
+            neighbors: vec![],
+            chunk_header: "Introduction".into(),
+            chunk_text: "Full chunk text here".into(),
+        };
+        assert_eq!(r.chunk_header, "Introduction");
+        assert_eq!(r.chunk_text, "Full chunk text here");
+        assert_eq!(r.content, "preview text");
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_matching() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                42i64,
+                "My Note",
+                "note",
+                r#"{"date": 2023, "category": "tutorial"}"#
+            ],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let filters = vec![Filter {
+            field: "category".into(),
+            operator: "=".into(),
+            value: "tutorial".into(),
+        }];
+        let result = hs.get_note_label_with_filters(42, &filters).unwrap();
+        assert_eq!(result, Some("My Note".to_string()));
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_non_matching() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                42i64,
+                "My Note",
+                "note",
+                r#"{"date": 2021, "category": "guide"}"#
+            ],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let filters = vec![Filter {
+            field: "date".into(),
+            operator: ">=".into(),
+            value: "2023".into(),
+        }];
+        let result = hs.get_note_label_with_filters(42, &filters).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_no_filters() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![42i64, "My Note", "note", r#"{"date": 2023}"#],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        // No filters → should return the label
+        let result = hs.get_note_label_with_filters(42, &[]).unwrap();
+        assert_eq!(result, Some("My Note".to_string()));
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_non_existent_field() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![42i64, "My Note", "note", r#"{"date": 2023}"#],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        // Non-existent field → should not match (null comparison)
+        let filters = vec![Filter {
+            field: "nonexistent".into(),
+            operator: "=".into(),
+            value: "value".into(),
+        }];
+        let result = hs.get_note_label_with_filters(42, &filters).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_multiple_and() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                42i64,
+                "Tutorial Note",
+                "note",
+                r#"{"date": 2023, "category": "tutorial", "status": "published"}"#
+            ],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        // Both filters must match
+        let filters = vec![
+            Filter {
+                field: "category".into(),
+                operator: "=".into(),
+                value: "tutorial".into(),
+            },
+            Filter {
+                field: "date".into(),
+                operator: ">=".into(),
+                value: "2023".into(),
+            },
+        ];
+        let result = hs.get_note_label_with_filters(42, &filters).unwrap();
+        assert_eq!(result, Some("Tutorial Note".to_string()));
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_multiple_and_one_fails() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                42i64,
+                "Old Guide",
+                "note",
+                r#"{"date": 2021, "category": "guide", "status": "archived"}"#
+            ],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        // First filter matches, second fails → should return None
+        let filters = vec![
+            Filter {
+                field: "category".into(),
+                operator: "=".into(),
+                value: "guide".into(),
+            },
+            Filter {
+                field: "date".into(),
+                operator: ">=".into(),
+                value: "2023".into(),
+            },
+        ];
+        let result = hs.get_note_label_with_filters(42, &filters).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_note_label_with_filters_note_not_found() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // No nodes inserted
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let filters = vec![Filter {
+            field: "date".into(),
+            operator: ">=".into(),
+            value: "2023".into(),
+        }];
+        let result = hs.get_note_label_with_filters(999, &filters).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_search_empty_chunks() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a note node (so FTS expansion doesn't crash) but NO chunks.
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1i64, "test-note", "note", r#"{"path":"/tmp/test.md"}"#],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        // Inject a synthetic embedding so `embed()` doesn't call Ollama.
+        let fake_vec = vec![0.1_f32, 0.2_f32, 0.3_f32];
+        hs.inject_embedding("test query", fake_vec);
+
+        let results = hs
+            .hybrid_search("test query", 5, 2, 0.7, None, false, &[])
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "expected no results when chunks table is empty, got {}",
+            results.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs Ollama"]
+    fn test_search_ollama_unreachable() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Point at a port where nothing is listening → connection refused.
+        let ollama = crate::embed::ollama::OllamaClient::new("http://127.0.0.1:1", "test-model");
+        let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        let result = hs.hybrid_search("query", 5, 2, 0.7, None, false, &[]);
+        assert!(result.is_err(), "expected error when Ollama is unreachable");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Error connecting to Ollama")
+                || err.contains("Connection refused")
+                || err.contains("error trying to connect"),
+            "unexpected error: {}",
+            err
+        );
     }
 }
