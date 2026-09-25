@@ -1,5 +1,3 @@
-pub mod synthetic;
-
 use anyhow::Result;
 
 /// Convierte un vector de floats a BLOB binario (float32 LE)
@@ -24,6 +22,7 @@ pub fn norm(v: &[f32]) -> f32 {
 }
 
 /// Normaliza un vector a longitud unitaria
+#[allow(dead_code)]
 pub fn normalize(v: &[f32]) -> Vec<f32> {
     let n = norm(v);
     if n == 0.0 {

@@ -10,9 +10,11 @@
 //!
 //! | Table         | Purpose                                                  |
 //! |---------------|----------------------------------------------------------|
-//! | `nodes`       | Every entity in the graph (notes, people, tags, …).      |
-//! | `edges`       | Labelled, weighted, directed relationships between nodes.|
-//! | `notes_fts`   | FTS5 virtual table for full-text search on title/content.|
+//! | `nodes`        | Every entity in the graph (notes, people, tags, …).        |
+//! | `edges`        | Labelled, weighted, directed relationships between nodes.  |
+//! | `notes_fts`    | FTS5 virtual table for full-text search on title/content.  |
+//! | `chunks`       | Content fragments extracted from note nodes.               |
+//! | `communities`  | Clusters of entities found by Leiden community detection.  |
 //!
 //! # FTS sync
 //!
@@ -50,6 +52,12 @@ use anyhow::Context;
 ///
 /// * **`notes_fts`** — An FTS5 virtual table over `title` and
 ///   `content`.  Repopulated by `graphrag build` (no triggers).
+///
+/// * **`chunks`** — Content fragments extracted from note nodes, each
+///   with a header, slug, text, and optional embedding BLOB.
+///
+/// * **`communities`** — Clusters of entities found by Leiden community
+///   detection, with hierarchical levels and summary embeddings.
 pub const SCHEMA_MAIN: &str = r#"
 -- Tabla de nodos: notas, entidades, etiquetas
 CREATE TABLE IF NOT EXISTS nodes (
@@ -82,6 +90,39 @@ CREATE INDEX IF NOT EXISTS idx_nodes_type   ON nodes(type);
 -- Índice FTS5 para búsqueda textual (tabla independiente)
 -- NOTA: Sin triggers. El build repuebla FTS5 desde Rust.
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, content);
+
+-- Tabla de chunks: fragmentos de contenido con embedding
+CREATE TABLE IF NOT EXISTS chunks (
+    id          INTEGER PRIMARY KEY,
+    note_id     INTEGER NOT NULL REFERENCES nodes(id),
+    header      TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    embedding   BLOB,
+    metadata    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_note_id ON chunks(note_id);
+
+-- Tabla de comunidades: clusters de entidades (Leiden)
+CREATE TABLE IF NOT EXISTS communities (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    label             TEXT    NOT NULL,
+    level             INTEGER NOT NULL DEFAULT 0,
+    parent_id         INTEGER REFERENCES communities(id),
+    summary           TEXT,
+    summary_embedding BLOB,
+    member_ids        TEXT    NOT NULL DEFAULT '[]',
+    member_count      INTEGER NOT NULL DEFAULT 0,
+    algorithm         TEXT    NOT NULL DEFAULT 'leiden',
+    quality_fn        TEXT    NOT NULL DEFAULT 'cpm',
+    resolution        REAL    NOT NULL DEFAULT 1.0,
+    summary_model     TEXT,
+    embed_model       TEXT,
+    summary_tokens    INTEGER,
+    created_at        TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_communities_level ON communities(level);
+CREATE INDEX IF NOT EXISTS idx_communities_parent ON communities(parent_id);
 "#;
 
 /// Schema DDL *plus* seed data for a minimal bootstrapped graph.
@@ -159,6 +200,39 @@ CREATE INDEX IF NOT EXISTS idx_nodes_type   ON nodes(type);
 -- Índice FTS5 para búsqueda textual (tabla independiente)
 -- NOTA: Sin triggers. El build repuebla FTS5 desde Rust.
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title, content);
+
+-- Tabla de chunks: fragmentos de contenido con embedding
+CREATE TABLE IF NOT EXISTS chunks (
+    id          INTEGER PRIMARY KEY,
+    note_id     INTEGER NOT NULL REFERENCES nodes(id),
+    header      TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    embedding   BLOB,
+    metadata    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_note_id ON chunks(note_id);
+
+-- Tabla de comunidades: clusters de entidades (Leiden)
+CREATE TABLE IF NOT EXISTS communities (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    label             TEXT    NOT NULL,
+    level             INTEGER NOT NULL DEFAULT 0,
+    parent_id         INTEGER REFERENCES communities(id),
+    summary           TEXT,
+    summary_embedding BLOB,
+    member_ids        TEXT    NOT NULL DEFAULT '[]',
+    member_count      INTEGER NOT NULL DEFAULT 0,
+    algorithm         TEXT    NOT NULL DEFAULT 'leiden',
+    quality_fn        TEXT    NOT NULL DEFAULT 'cpm',
+    resolution        REAL    NOT NULL DEFAULT 1.0,
+    summary_model     TEXT,
+    embed_model       TEXT,
+    summary_tokens    INTEGER,
+    created_at        TEXT    DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_communities_level ON communities(level);
+CREATE INDEX IF NOT EXISTS idx_communities_parent ON communities(parent_id);
 
 -- Seed data: bootstrap nodes
 INSERT OR IGNORE INTO nodes (id, label, type, metadata) VALUES
@@ -352,10 +426,41 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // Expected: nodes, edges, notes_fts, sqlite_sequence (auto).
+        // Expected: nodes, edges, notes_fts, chunks, communities, sqlite_sequence.
         assert!(
-            table_count >= 3,
-            "expected at least 3 tables, got {table_count}"
+            table_count >= 5,
+            "expected at least 5 tables, got {table_count}"
         );
+    }
+
+    /// Verify that the `chunks` table does NOT exist yet in the current
+    /// schema.  This test encodes the *desired* future behaviour: once
+    /// the `chunks` table is added in the GREEN phase, the INSERT will
+    /// succeed — right now it fails, which is the RED signal.
+    #[test]
+    fn test_chunks_table_exists() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a parent node for the FK reference.
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1i64, "test-note", "note", r#"{"content":"test"}"#],
+        )
+        .unwrap();
+
+        // Try to insert a row into the `chunks` table.
+        conn.execute(
+            "INSERT INTO chunks (note_id, header, text, slug, embedding, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                1i64,                          // note_id
+                "Introduction",                // header
+                "This is the chunk text.",     // text
+                "introduction",                // slug
+                None::<Vec<u8>>,               // embedding (NULL)
+                None::<String>,                // metadata (NULL)
+            ],
+        )
+        .unwrap();
     }
 }
