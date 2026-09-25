@@ -14,16 +14,20 @@
 
 </div>
 
+🇪🇸 *Esta es la traducción al español. La versión original en inglés está en [README.md](./README.md).*
+
 ---
 
-## 🧭 GraphRAG for absolute beginners
+## 🧭 GraphRAG para quien no tiene ni idea
 
-*(If you already know what RAG, vectors, and knowledge graphs are, skip ahead to [What is Graph RAG?](#-what-is-graph-rag))*
+*(English version: [README.md](./README.md))*
 
-### The problem: hundreds of notes, can't find anything
+*(Si ya sabes lo que es RAG, vectores y grafos de conocimiento, sáltate esto y ve directo a [What is Graph RAG?](#-what-is-graph-rag))*
 
-Imagine you've been taking notes about Linux for years. You have a `~/linux-notes/`
-folder with **500 Markdown files** on topics like:
+### El problema: tienes cientos de apuntes y no encuentras nada
+
+Imagina que llevas años tomando notas sobre Linux. Tienes una carpeta `~/linux-notes/`
+con **500 archivos Markdown** sobre temas como:
 
 ```
 linux-notes/
@@ -38,125 +42,125 @@ linux-notes/
 ├── lvm-redimensionar.md
 ├── nginx-proxy-inverso.md
 ├── rsync-incremental-backup.md
-├── ... (500 files)
+├── ... (500 archivos)
 ```
 
-When you need to find something, you do the usual:
+Cuando necesitas encontrar algo, haces lo de siempre:
 
 ```bash
-grep -ri "partitions" ~/linux-notes/
+grep -ri "particiones" ~/linux-notes/
 ```
 
-And it works... until it doesn't. Because:
+Y funciona... hasta que no funciona. Porque:
 
-- You search **"partitions"** but the note is titled **"resizing LVM"** and never uses that word
-- You search **"network monitoring"** but your note talks about **"ntopng"** and **"iftop"** without saying "monitoring"
-- You search **"high availability"** and get one note, but you miss the **"keepalived"** and **"nginx load balancing"** notes that are closely related
+- Buscas **"particiones"** pero la nota se titula **"redimensionar LVM"** y nunca usa esa palabra
+- Buscas **"monitorizar red"** pero tu nota habla de **"ntopng"** y **"iftop"** sin decir "monitorizar"
+- Buscas **"alta disponibilidad"** y te sale una nota suelta, pero te pierdes la de **"keepalived"** y la de **"balanceo nginx"** que están relacionadísimas
 
-**Your knowledge is there. The problem is you don't know it's there.**
+**Tu conocimiento está ahí. El problema es que no sabes que está ahí.**
 
 ---
 
-### The solution: a search engine that understands *relationships*, not just words
+### La solución: un buscador que entiende *relaciones*, no solo palabras
 
-GraphRAG scans your 500 Linux notes, automatically extracts key concepts
-(apt, systemd, LVM, Nginx, Docker, firewalld...) and builds a **knowledge map**
-that knows how they relate to each other.
+GraphRAG escanea tus 500 notas de Linux, extrae automáticamente los conceptos clave
+(apt, systemd, LVM, Nginx, Docker, firewalld...) y construye un **mapa de conocimiento**
+que sabe cómo se relacionan entre sí.
 
-Now, when you search:
+Ahora, cuando buscas:
 
 ```bash
-graphrag search "hard disk partitions" linux.db
+graphrag search "particiones disco duro" linux.db
 ```
 
-GraphRAG doesn't just find the note mentioning "partitions". It also shows you:
-- The note about **LVM** (because LVM and partitions are neighboring concepts in the graph)
-- The note about **GPT vs MBR** (connected through `partitioning`)
-- The note about **mounting filesystems** (connected by `disk` → `storage`)
+GraphRAG no solo encuentra la nota que menciona "particiones". También te muestra:
+- La nota sobre **LVM** (porque LVM y particiones son conceptos vecinos en el grafo)
+- La nota sobre **GPT vs MBR** (porque está conectada a través de `particionado`)
+- La nota sobre **montar sistema de archivos** (conectada por `disco` → `almacenamiento`)
 
-**This is Graph RAG**: a search engine that uncovers connections you didn't even know existed.
+**Esto es Graph RAG**: un buscador que descubre conexiones que tú mismo no sabías que existían.
 
 ---
 
-### Real-world example: how it works with your Linux notes
+### Ejemplo real: cómo funciona con tus notas de Linux
 
-#### 1. Build the knowledge map
+#### 1. Construyes el mapa de conocimiento
 
 ```bash
-# One command scans all your notes and builds the graph
+# Un solo comando escanea todas tus notas y construye el grafo
 graphrag build ~/linux-notes linux.db
 ```
 
-Under the hood, GraphRAG:
-1. Reads each note and splits it into sections
-2. Sends sections to a local AI (Ollama) that extracts entities like `systemd`,
-   `docker`, `nginx`, `partitioning`, `firewall`
-3. Detects which entities appear together in the same notes (co-occurrence)
-4. Builds a graph where each entity is a node and each co-occurrence is a connection
-5. Computes embeddings (vectors) for each note and entity
+Detrás de escena, GraphRAG:
+1. Lee cada nota y la divide en secciones
+2. Envía las secciones a una IA local (Ollama) que extrae entidades como `systemd`,
+   `docker`, `nginx`, `particionado`, `firewall`
+3. Detecta qué entidades aparecen juntas en las mismas notas (co-ocurrencia)
+4. Construye un grafo donde cada entidad es un nodo y cada co-ocurrencia es una conexión
+5. Calcula embeddings (vectores) para cada nota y entidad
 
-The result is a SQLite database that knows:
+El resultado es una base de datos SQLite que sabe que:
 ```
-[Docker] ──co-occurs── [Nginx] ──co-occurs── [reverse-proxy]
-                                              ──co-occurs── [certbot-ssl]
-                                              ──co-occurs── [load-balancing]
+[Docker] ──co-ocurre── [Nginx] ──co-ocurre── [proxy-inverso]
+                                              ──co-ocurre── [certbot-ssl]
+                                              ──co-ocurre── [balanceo-carga]
 ```
 
-#### 2. Search for something specific
+#### 2. Buscas algo concreto
 
 ```bash
-graphrag search "secure web server" linux.db -k 5
+graphrag search "servidor web seguro" linux.db -k 5
 ```
 
-Results:
+Resultado:
 ```
- 1. Nginx as reverse proxy                  Score: 0.92
-    Connections: nginx, reverse-proxy, http
+ 1. Nginx como proxy inverso                Puntuación: 0.92
+    Conexiones: nginx, proxy-inverso, http
 
- 2. Certbot: SSL certificates with Let's Encrypt  Score: 0.67
-    Connections: ssl, certbot, nginx
-    ↑ Appears because it shares "nginx" with the previous note
+ 2. Certbot: certificados SSL con Let's Encrypt  Puntuación: 0.67
+    Conexiones: ssl, certbot, nginx
+    ↑ Aparece porque comparte "nginx" con la nota anterior
 
- 3. Fail2ban: protecting SSH and services    Score: 0.45
-    Connections: fail2ban, firewall, security
-    ↑ Appears because "security" is connected to "nginx" in the graph
+ 3. Fail2ban: proteger SSH y servicios       Puntuación: 0.45
+    Conexiones: fail2ban, firewall, seguridad
+    ↑ Aparece porque "seguridad" está conectado a "nginx" en el grafo
 ```
 
-Note 3 never mentions "secure web server" — but GraphRAG knows that
-fail2ban is used to protect web servers, because both notes share
-entities in the graph. **grep would never have shown you that note.**
+La nota 3 nunca menciona "servidor web" ni "seguro" — pero GraphRAG sabe que
+fail2ban se usa para proteger servidores web, porque ambas notas comparten
+entidades en el grafo. **grep jamás te habría mostrado esa nota.**
 
-#### 3. Explore connections
+#### 3. Explorar conexiones
 
 ```bash
-# What does Docker have to do with systemd?
+# ¿Qué tiene que ver Docker con systemd?
 graphrag path "Docker" "systemd" linux.db
-# → Docker → containers → systemd → services
+# → Docker → contenedores → systemd → servicios
 
-# What entities surround "firewall"?
+# ¿Qué entidades rodean a "firewall"?
 graphrag graph "firewall" linux.db -d 1
-# Neighbors: ufw, iptables, nftables, fail2ban, security, ports
+# Vecinos: ufw, iptables, nftables, fail2ban, seguridad, puertos
 
-# General statistics
+# Estadísticas generales
 graphrag stats linux.db
-# → 500 notes, 1200 entities, 3400 connections
+# → 500 notas, 1200 entidades, 3400 conexiones
 ```
 
 ---
 
-### And all this without internet?
+### ¿Y todo esto sin internet?
 
-Yes. GraphRAG is a **single Rust binary** that:
-- Doesn't need Python, Node.js, or Docker
-- Runs entirely on your machine, 100% local
-- Never sends your data to any server
-- If you don't have Ollama, uses synthetic embeddings (no external AI needed)
-- The SQLite database is smaller than an MP3 and fully portable
+Sí. GraphRAG es un **binario único de Rust** que:
+- No necesita Python, Node.js, ni Docker
+- Todo corre en tu máquina, 100% local
+- No envía tus datos a ningún servidor
+- Si no tienes Ollama, usa embeddings sintéticos (sin IA externa)
+- La base de datos SQLite pesa menos que un MP3 y es portátil
 
-**In summary:** If you have hundreds of Markdown notes and you're tired of searching
-with grep or missing notes you know exist but can't find,
-GraphRAG is the search engine that turns your file chaos into an
-explorable knowledge map.
+**En resumen:** Si tienes cientos de notas en Markdown y estás harto de buscar
+con grep o de perderte notas que sabes que existen pero no encuentras,
+GraphRAG es el buscador que convierte tu caos de archivos en un mapa
+explorable de conocimiento.
 
 ---
 
