@@ -1,4 +1,9 @@
 # Changelog
+## [0.1.2] - 2026-09-25
+
+### Bug Fixes
+
+- Force sync development branch in release workflow
 ## [0.1.1] - 2026-09-25
 
 ### Bug Fixes
@@ -14,6 +19,7 @@
 ### Miscellaneous Tasks
 
 - Add gitflow setup with CI/CD workflows
+- Release v0.1.1
 
 ### Other
 
