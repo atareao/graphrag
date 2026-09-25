@@ -1,26 +1,18 @@
 # Changelog
-## [0.1.2] - 2026-09-25
-
-### Bug Fixes
-
-- Force sync development branch in release workflow
-## [0.1.1] - 2026-09-25
-
-### Bug Fixes
-
-- Use GITHUB_TOKEN instead of GH_PAT for checkout
+## [0.2.0] - 2026-09-25
 
 ### Features
 
-- Parallel build, NER batch, configurable threads, reset, completions, neovim init
-- Add --notes-only flag, synthetic embeddings in build, and fmt
-- Community detection (Leiden), LLM summarization, and answer mode
+- ✨ Community detection with Leiden CPM hierarchical clustering
+- ✨ LLM-powered community summarization (JSON structured output)
+- ✨ Answer mode: community summaries + chunk evidence as RAG context
+- ✨ Chunk embeddings via Ollama for hybrid search
+- ✨ Metadata filters (`--min-weight`, `--notes-only`)
+- ✨ MCP tools: `community_detect`, `community_summarize`, `search_answer`
+- ✨ Config: `summary_model`, default `embed_model` → `bge-m3:latest`
+- ✨ OpenSpec specs for all modules
 
-### Miscellaneous Tasks
+### Bug Fixes
 
-- Add gitflow setup with CI/CD workflows
-- Release v0.1.1
-
-### Other
-
-- V0.2.0
+- CI: Use `GITHUB_TOKEN` for checkout, `GH_PAT` for push/sync
+- CI: Force update development branch after release
