@@ -38,7 +38,9 @@ use crate::map::{MapEdge, MapNode};
 
 /// Recalculate offset so the selected node is centered in the viewport.
 fn recenter_on_selected(state: &mut AppState) {
-    let Some(sel) = state.selected_idx else { return };
+    let Some(sel) = state.selected_idx else {
+        return;
+    };
     let (world_w, world_h) = world_bounds(&state.positions);
     if world_w < 1.0 || world_h < 1.0 {
         return;
@@ -492,7 +494,9 @@ fn render_canvas<'a>(
                 let mid_y = (y1 + y2) / 2.0;
                 let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
                 if display_mode == "id" && dist > 8.0 && edge.weight > 0.0 {
-                    let weight_label = format!("{:.2}", edge.weight).trim_start_matches('0').to_string();
+                    let weight_label = format!("{:.2}", edge.weight)
+                        .trim_start_matches('0')
+                        .to_string();
                     ctx.print(mid_x, mid_y, weight_label);
                 }
             }
@@ -716,10 +720,10 @@ fn render_status<'a>(state: &AppState) -> Paragraph<'a> {
 
     // Keybinding hints.
     let hints = if state.show_preview {
-            "↵ close preview   q/esc quit"
-        } else {
-            "↑↓←→ navigate  ↵ preview  t filter  i display  +/- zoom  / search  q quit"
-        };
+        "↵ close preview   q/esc quit"
+    } else {
+        "↑↓←→ navigate  ↵ preview  t filter  i display  +/- zoom  / search  q quit"
+    };
 
     let mut parts: Vec<String> = vec![node_info, display_info, zoom_info, filter_info.to_string()];
     if !search_info.is_empty() {
