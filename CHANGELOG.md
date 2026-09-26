@@ -1,4 +1,9 @@
 # Changelog
+## [0.2.6] - 2026-09-26
+
+### Other
+
+- Update crossterm 0.28→0.29, ratatui 0.29→0.30 (#16)
 ## [0.2.5] - 2026-09-26
 
 ### Documentation
@@ -8,6 +13,7 @@
 ### Miscellaneous Tasks
 
 - Remove stray file
+- Release v0.2.5
 
 ### Other
 
@@ -19,6 +25,11 @@
 - Focus-based navigation, zoom centered on selection, display mode toggle
 - Column layout with auto-focus, Enter previews notes
 ## [0.2.4] - 2026-09-25
+
+### Miscellaneous Tasks
+
+- Release v0.2.4
+## [0.3.0] - 2026-09-25
 
 ### Documentation
 
@@ -38,7 +49,6 @@
 - Resolve merge conflict in README.es.md
 - Release v0.3.0 (#10)
 - Release v0.3.0
-- Release v0.2.4
 ## [0.2.3] - 2026-09-25
 
 ### Bug Fixes
