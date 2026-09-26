@@ -127,14 +127,24 @@ pub fn cmd_map(db: &str, from: Option<String>, depth: i32) -> Result<()> {
     let state = crate::map::tui::AppState {
         nodes: data.nodes,
         edges: data.edges,
-        positions: layout.positions,
+        positions: layout.positions.clone(),
         selected_idx: None,
+        focus_idx: None,
         filter_type: None,
         search_query: String::new(),
         search_active: false,
         offset_x: 0.0,
         offset_y: 0.0,
         depth,
+        display_mode: "id".to_string(),
+        zoom: 1.0,
+        last_canvas_w: 80.0,
+        last_canvas_h: 40.0,
+        needs_recenter: false,
+        db_path: db.to_string(),
+        show_preview: false,
+        preview_content: String::new(),
+        original_positions: layout.positions,
     };
 
     crate::map::tui::run_tui(state)
