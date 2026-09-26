@@ -392,7 +392,7 @@ fn render_canvas<'a>(
                 let mid_x = (x1 + x2) / 2.0;
                 let mid_y = (y1 + y2) / 2.0;
                 let dist = ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
-                if dist > 8.0 && edge.weight > 0.0 {
+                if display_mode == "id" && dist > 8.0 && edge.weight > 0.0 {
                     let weight_label = format!("{:.2}", edge.weight).trim_start_matches('0').to_string();
                     ctx.print(mid_x, mid_y, weight_label);
                 }
