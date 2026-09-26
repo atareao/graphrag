@@ -1,4 +1,23 @@
 # Changelog
+## [0.2.5] - 2026-09-26
+
+### Documentation
+
+- Add map command documentation to READMEs
+
+### Miscellaneous Tasks
+
+- Remove stray file
+
+### Other
+
+- Show edge weight instead of type label on map edges
+- Edge weight only in 'id' display mode, hidden otherwise
+
+### Refactor
+
+- Focus-based navigation, zoom centered on selection, display mode toggle
+- Column layout with auto-focus, Enter previews notes
 ## [0.2.4] - 2026-09-25
 
 ### Documentation
@@ -19,6 +38,7 @@
 - Resolve merge conflict in README.es.md
 - Release v0.3.0 (#10)
 - Release v0.3.0
+- Release v0.2.4
 ## [0.2.3] - 2026-09-25
 
 ### Bug Fixes
