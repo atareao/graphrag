@@ -92,6 +92,14 @@ pub struct AppState {
     pub last_canvas_h: f64,
     /// Flag: recalculate offset on next render.
     pub needs_recenter: bool,
+    /// Path to the SQLite database (for loading preview content).
+    pub db_path: String,
+    /// Whether the preview panel is visible.
+    pub show_preview: bool,
+    /// Content to display in the preview panel.
+    pub preview_content: String,
+    /// Original force-directed positions (restored when focus is cleared).
+    pub original_positions: Vec<Position>,
 }
 
 impl Default for AppState {
@@ -113,6 +121,10 @@ impl Default for AppState {
             last_canvas_w: 80.0,
             last_canvas_h: 40.0,
             needs_recenter: false,
+            db_path: String::new(),
+            show_preview: false,
+            preview_content: String::new(),
+            original_positions: Vec::new(),
         }
     }
 }
@@ -138,6 +150,93 @@ fn world_bounds(positions: &[Position]) -> (f64, f64) {
         .fold(f64::NEG_INFINITY, f64::max);
     // Guard against degenerate cases where all nodes are at 0,0.
     (w.max(100.0), h.max(100.0))
+}
+
+/// Compute column layout positions for focus mode.
+///
+/// Places the focus node at the centre, predecessors on the left, and
+/// successors on the right.  Non-visible nodes keep their original positions.
+fn compute_column_layout(state: &mut AppState) {
+    let Some(focus) = state.focus_idx else { return };
+
+    // Collect unique predecessor and successor indices.
+    let focus_id = state.nodes[focus].id;
+    let mut preds: Vec<usize> = Vec::new();
+    let mut succs: Vec<usize> = Vec::new();
+
+    for edge in &state.edges {
+        if edge.target_id == focus_id {
+            if let Some(idx) = state.nodes.iter().position(|n| n.id == edge.source_id) {
+                if !preds.contains(&idx) {
+                    preds.push(idx);
+                }
+            }
+        }
+        if edge.source_id == focus_id {
+            if let Some(idx) = state.nodes.iter().position(|n| n.id == edge.target_id) {
+                if !succs.contains(&idx) {
+                    succs.push(idx);
+                }
+            }
+        }
+    }
+
+    // World-coordinate bounds (200 x 150 by default from force-directed).
+    let (world_w, world_h) = world_bounds(&state.original_positions);
+    let center_x = world_w / 2.0;
+    let center_y = world_h / 2.0;
+
+    // Reset all positions to original first.
+    state.positions.copy_from_slice(&state.original_positions);
+
+    // Place focus node at centre.
+    state.positions[focus].x = center_x;
+    state.positions[focus].y = center_y;
+
+    let col_gap = world_w / 5.0;
+    let vert_spacing = (world_h / (preds.len().max(succs.len()).max(3) as f64 + 1.0)).min(20.0);
+
+    for (i, &pred) in preds.iter().enumerate() {
+        let total = vert_spacing * (preds.len()).saturating_sub(1) as f64;
+        let start_y = center_y - total / 2.0;
+        state.positions[pred].x = center_x - col_gap;
+        state.positions[pred].y = start_y + i as f64 * vert_spacing;
+    }
+
+    for (i, &succ) in succs.iter().enumerate() {
+        let total = vert_spacing * (succs.len()).saturating_sub(1) as f64;
+        let start_y = center_y - total / 2.0;
+        state.positions[succ].x = center_x + col_gap;
+        state.positions[succ].y = start_y + i as f64 * vert_spacing;
+    }
+}
+
+/// Load the content of a note node from the database for preview.
+fn load_note_content(db_path: &str, node_id: i64) -> String {
+    use rusqlite::Connection;
+    match Connection::open(db_path) {
+        Ok(conn) => {
+            let sql = "SELECT COALESCE(chunks.text, nodes.metadata) FROM nodes LEFT JOIN chunks ON chunks.note_id = nodes.id WHERE nodes.id = ?1 LIMIT 1";
+            match conn.query_row(sql, [node_id], |row| row.get::<_, String>(0)) {
+                Ok(text) => {
+                    // Try to extract content from JSON metadata.
+                    if text.trim_start().starts_with('{') {
+                        serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("content")
+                                    .and_then(|c| c.as_str().map(|s| s.to_string()))
+                            })
+                            .unwrap_or(text)
+                    } else {
+                        text
+                    }
+                }
+                Err(_) => format!("(no content available for node {node_id})"),
+            }
+        }
+        Err(e) => format!("(error opening database: {e})"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +656,25 @@ fn render_details<'a>(state: &'a AppState) -> Paragraph<'a> {
     .block(Block::default().borders(Borders::ALL).title(" Details "))
 }
 
+/// Build the preview [`Paragraph`] widget showing note content.
+fn render_preview<'a>(state: &'a AppState) -> Paragraph<'a> {
+    let lines: Vec<TextLine> = state
+        .preview_content
+        .lines()
+        .map(|l| TextLine::from(Span::raw(l)))
+        .collect();
+    Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Preview: {} ",
+            state
+                .selected_idx
+                .and_then(|i| state.nodes.get(i))
+                .map(|n| n.label.as_str())
+                .unwrap_or("")
+        )))
+        .style(Style::default().fg(Color::White))
+}
+
 /// Build the status bar [`Paragraph`] widget.
 fn render_status<'a>(state: &AppState) -> Paragraph<'a> {
     let total = state.nodes.len();
@@ -597,7 +715,11 @@ fn render_status<'a>(state: &AppState) -> Paragraph<'a> {
     };
 
     // Keybinding hints.
-    let hints = "↑↓←→ select  ↵ details  t filter  i display  +/- zoom  / search  q quit";
+    let hints = if state.show_preview {
+            "↵ close preview   q/esc quit"
+        } else {
+            "↑↓←→ navigate  ↵ preview  t filter  i display  +/- zoom  / search  q quit"
+        };
 
     let mut parts: Vec<String> = vec![node_info, display_info, zoom_info, filter_info.to_string()];
     if !search_info.is_empty() {
@@ -664,6 +786,7 @@ fn event_loop(
         if state.focus_idx.is_none() && !state.nodes.is_empty() {
             state.focus_idx = Some(0);
             state.selected_idx = Some(0);
+            compute_column_layout(state);
         }
 
         // Re-center if needed (after zoom or focus change)
@@ -737,9 +860,14 @@ fn event_loop(
             );
             f.render_widget(canvas_widget, horiz[0]);
 
-            // Details panel.
-            let details_widget = render_details(state);
-            f.render_widget(details_widget, horiz[1]);
+            // Details / Preview panel.
+            if state.show_preview {
+                let preview_widget = render_preview(state);
+                f.render_widget(preview_widget, horiz[1]);
+            } else {
+                let details_widget = render_details(state);
+                f.render_widget(details_widget, horiz[1]);
+            }
 
             // Status bar.
             let status_widget = render_status(state);
@@ -770,6 +898,15 @@ fn event_loop(
     Ok(())
 }
 
+/// Move focus to the selected node and recompute column layout.
+fn move_focus_to_selected(state: &mut AppState) {
+    if state.selected_idx != state.focus_idx {
+        state.focus_idx = state.selected_idx;
+        compute_column_layout(state);
+        state.needs_recenter = true;
+    }
+}
+
 /// Handle a key-press event.  Returns `true` if the application should quit.
 fn handle_key(state: &mut AppState, code: KeyCode) -> bool {
     if state.search_active {
@@ -777,28 +914,50 @@ fn handle_key(state: &mut AppState, code: KeyCode) -> bool {
     }
 
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => true,
+        KeyCode::Char('q') => {
+            if state.show_preview {
+                state.show_preview = false;
+                false
+            } else {
+                true
+            }
+        }
+        KeyCode::Esc => {
+            if state.show_preview {
+                state.show_preview = false;
+                false
+            } else {
+                true
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected_idx = nearest_node_in_direction(state, 0.0, 1.0);
+            move_focus_to_selected(state);
             false
         }
         KeyCode::Down | KeyCode::Char('j') => {
             state.selected_idx = nearest_node_in_direction(state, 0.0, -1.0);
+            move_focus_to_selected(state);
             false
         }
         KeyCode::Left | KeyCode::Char('h') => {
             state.selected_idx = nearest_node_in_direction(state, -1.0, 0.0);
+            move_focus_to_selected(state);
             false
         }
         KeyCode::Right | KeyCode::Char('l') => {
             state.selected_idx = nearest_node_in_direction(state, 1.0, 0.0);
+            move_focus_to_selected(state);
             false
         }
         KeyCode::Enter => {
-            if let Some(sel) = state.selected_idx {
-                if state.focus_idx != Some(sel) {
-                    state.focus_idx = Some(sel);
-                    state.needs_recenter = true;
+            if state.show_preview {
+                state.show_preview = false;
+            } else if let Some(sel) = state.selected_idx {
+                let node = &state.nodes[sel];
+                if node.type_.eq_ignore_ascii_case("note") {
+                    state.preview_content = load_note_content(&state.db_path, node.id);
+                    state.show_preview = true;
                 }
             }
             false
@@ -1012,6 +1171,10 @@ mod tests {
             last_canvas_w: 80.0,
             last_canvas_h: 40.0,
             needs_recenter: false,
+            db_path: String::new(),
+            show_preview: false,
+            preview_content: String::new(),
+            original_positions: Vec::new(),
         }
     }
 
