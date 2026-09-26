@@ -36,6 +36,19 @@ use ratatui::{
 use crate::map::layout::Position;
 use crate::map::{MapEdge, MapNode};
 
+/// Recalculate offset so the selected node is centered in the viewport.
+fn recenter_on_selected(state: &mut AppState) {
+    let Some(sel) = state.selected_idx else { return };
+    let (world_w, world_h) = world_bounds(&state.positions);
+    if world_w < 1.0 || world_h < 1.0 {
+        return;
+    }
+    let cw = state.last_canvas_w;
+    let ch = state.last_canvas_h;
+    state.offset_x = cw / 2.0 - state.positions[sel].x * (cw / world_w) * state.zoom;
+    state.offset_y = ch / 2.0 - state.positions[sel].y * (ch / world_h) * state.zoom;
+}
+
 // ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
@@ -52,6 +65,10 @@ pub struct AppState {
     pub positions: Vec<Position>,
     /// Index of the currently highlighted / selected node, if any.
     pub selected_idx: Option<usize>,
+    /// Index of the current "focus" node. Only this node and its direct
+    /// neighbors are shown in the Canvas. Set to `None` on init (first
+    /// visible node becomes focus).
+    pub focus_idx: Option<usize>,
     /// Optional type filter: `None` = all, `Some("note")`, `Some("entity")`,
     /// `Some("tag")`.
     pub filter_type: Option<String>,
@@ -66,6 +83,15 @@ pub struct AppState {
     /// Graph depth used when loading subgraphs.
     #[allow(dead_code)]
     pub depth: i32,
+    /// Display mode for node labels in the Canvas: "id", "truncated", or "label".
+    pub display_mode: String,
+    /// Zoom level (0.3 – 3.0).
+    pub zoom: f64,
+    /// Last canvas dimensions (for recentering on selected node).
+    pub last_canvas_w: f64,
+    pub last_canvas_h: f64,
+    /// Flag: recalculate offset on next render.
+    pub needs_recenter: bool,
 }
 
 impl Default for AppState {
@@ -75,12 +101,18 @@ impl Default for AppState {
             edges: Vec::new(),
             positions: Vec::new(),
             selected_idx: None,
+            focus_idx: None,
             filter_type: None,
             search_query: String::new(),
             search_active: false,
             offset_x: 0.0,
             offset_y: 0.0,
             depth: 2,
+            display_mode: "id".to_string(),
+            zoom: 1.0,
+            last_canvas_w: 80.0,
+            last_canvas_h: 40.0,
+            needs_recenter: false,
         }
     }
 }
@@ -164,12 +196,25 @@ pub fn node_at_position(
     canvas_h: f64,
 ) -> Option<usize> {
     let (world_w, world_h) = world_bounds(&state.positions);
+    let zoom = state.zoom;
     for (i, pos) in state.positions.iter().enumerate() {
-        let label_len = state.nodes[i].label.len() as f64;
-        let node_w = (label_len * 0.6).max(4.0);
+        let (label_len, _) = match state.display_mode.as_str() {
+            "id" => (4, format!("{}", state.nodes[i].id)),
+            "truncated" => {
+                let max_chars = 12;
+                let text = if state.nodes[i].label.len() > max_chars {
+                    format!("{}…", &state.nodes[i].label[..max_chars])
+                } else {
+                    state.nodes[i].label.clone()
+                };
+                (text.len(), text)
+            }
+            _ => (state.nodes[i].label.len(), state.nodes[i].label.clone()),
+        };
+        let node_w = (label_len as f64 * 0.6).max(4.0);
         let node_h = 3.0;
-        let sx = pos.x * (canvas_w / world_w) + state.offset_x;
-        let sy = pos.y * (canvas_h / world_h) + state.offset_y;
+        let sx = pos.x * (canvas_w / world_w) * zoom + state.offset_x;
+        let sy = pos.y * (canvas_h / world_h) * zoom + state.offset_y;
         if canvas_x >= sx && canvas_x <= sx + node_w && canvas_y >= sy && canvas_y <= sy + node_h {
             return Some(i);
         }
@@ -177,18 +222,52 @@ pub fn node_at_position(
     None
 }
 
-/// Return the indices of nodes that match the current filter.
+/// Return the indices of nodes visible in focus mode: the focus node itself
+/// plus all its direct neighbors, filtered by type.
 pub fn visible_nodes(state: &AppState) -> Vec<usize> {
-    let filter = state.filter_type.as_deref();
-    state
-        .nodes
+    let focus = match state.focus_idx {
+        Some(i) => i,
+        None => {
+            // No focus set → return first node (will be set on first render)
+            if state.nodes.is_empty() {
+                return vec![];
+            }
+            return vec![0];
+        }
+    };
+
+    let focus_id = state.nodes[focus].id;
+
+    // Start with the focus node itself, then add neighbors
+    let mut result = vec![focus];
+
+    // Collect all neighbor indices (directly connected by any edge)
+    let neighbor_indices: Vec<usize> = state
+        .edges
         .iter()
-        .enumerate()
-        .filter(|(_, n)| match filter {
-            None => true,
-            Some(ft) => n.type_.eq_ignore_ascii_case(ft),
+        .filter_map(|edge| {
+            if edge.source_id == focus_id {
+                // target is the neighbor — find its index
+                state.nodes.iter().position(|n| n.id == edge.target_id)
+            } else if edge.target_id == focus_id {
+                // source is the neighbor
+                state.nodes.iter().position(|n| n.id == edge.source_id)
+            } else {
+                None
+            }
         })
-        .map(|(i, _)| i)
+        .collect();
+
+    result.extend(neighbor_indices);
+
+    // Apply filter_type
+    let filter = state.filter_type.as_deref();
+    result
+        .into_iter()
+        .filter(|&i| match filter {
+            None => true,
+            Some(ft) => state.nodes[i].type_.eq_ignore_ascii_case(ft),
+        })
         .collect()
 }
 
@@ -237,36 +316,34 @@ fn render_canvas<'a>(
     edges: Vec<MapEdge>,
     positions: Vec<Position>,
     selected_idx: Option<usize>,
+    focus_idx: Option<usize>,
     filter_type: Option<String>,
     search_query: String,
     search_active: bool,
     offset_x: f64,
     offset_y: f64,
+    display_mode: String,
+    zoom: f64,
     canvas_area: Rect,
 ) -> Canvas<'a, impl Fn(&mut ratatui::widgets::canvas::Context)> {
     let canvas_w = canvas_area.width.max(1) as f64;
     let canvas_h = canvas_area.height.max(1) as f64;
     let (world_w, world_h) = world_bounds(&positions);
 
-    // Pre-compute visibility.
-    let filter_deref = filter_type.as_deref();
-    let visible_idx: Vec<usize> = nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| match filter_deref {
-            None => true,
-            Some(ft) => n.type_.eq_ignore_ascii_case(ft),
-        })
-        .map(|(i, _)| i)
-        .collect();
+    // Pre-compute visibility: focus node + its direct neighbors.
+    let visible_idx: Vec<usize> = {
+        let tmp = AppState {
+            focus_idx,
+            nodes: nodes.clone(),
+            edges: edges.clone(),
+            filter_type,
+            ..Default::default()
+        };
+        visible_nodes(&tmp)
+    };
 
-    let visible_ids: Vec<i64> = visible_idx.iter().map(|&i| nodes[i].id).collect();
-    let visible_edge_idx: Vec<usize> = edges
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| visible_ids.contains(&e.source_id) && visible_ids.contains(&e.target_id))
-        .map(|(i, _)| i)
-        .collect();
+    // Compute visible IDs set for filtering edges.
+    let visible_ids_set: Vec<i64> = visible_idx.iter().map(|&i| nodes[i].id).collect();
 
     let search_text = search_query.to_lowercase();
     let has_search = search_active && !search_text.is_empty();
@@ -278,8 +355,13 @@ fn render_canvas<'a>(
         .background_color(Color::Black)
         .paint(move |ctx| {
             // ---- Edges ----
-            for &ei in &visible_edge_idx {
-                let edge = &edges[ei];
+            // Show all edges between visible nodes (the set is small with focus mode)
+            for edge in edges.iter() {
+                if !visible_ids_set.contains(&edge.source_id)
+                    || !visible_ids_set.contains(&edge.target_id)
+                {
+                    continue;
+                }
                 let src_idx = nodes.iter().position(|n| n.id == edge.source_id);
                 let tgt_idx = nodes.iter().position(|n| n.id == edge.target_id);
                 let (Some(si), Some(ti)) = (src_idx, tgt_idx) else {
@@ -288,10 +370,10 @@ fn render_canvas<'a>(
                 let src_pos = &positions[si];
                 let tgt_pos = &positions[ti];
 
-                let x1 = src_pos.x * (canvas_w / world_w) + offset_x;
-                let y1 = src_pos.y * (canvas_h / world_h) + offset_y;
-                let x2 = tgt_pos.x * (canvas_w / world_w) + offset_x;
-                let y2 = tgt_pos.y * (canvas_h / world_h) + offset_y;
+                let x1 = src_pos.x * (canvas_w / world_w) * zoom + offset_x;
+                let y1 = src_pos.y * (canvas_h / world_h) * zoom + offset_y;
+                let x2 = tgt_pos.x * (canvas_w / world_w) * zoom + offset_x;
+                let y2 = tgt_pos.y * (canvas_h / world_h) * zoom + offset_y;
 
                 let on_screen =
                     (x1 >= -5.0 && x1 <= canvas_w + 5.0) || (x2 >= -5.0 && x2 <= canvas_w + 5.0);
@@ -320,13 +402,35 @@ fn render_canvas<'a>(
                 let node = &nodes[ni];
                 let pos = &positions[ni];
 
-                let node_w = (node.label.len() as f64 * 0.6).max(4.0);
                 let node_h = 3.0;
 
-                let sx = pos.x * (canvas_w / world_w) + offset_x;
-                let sy = pos.y * (canvas_h / world_h) + offset_y;
+                let (display_text, display_width) = match display_mode.as_str() {
+                    "id" => {
+                        let text = format!("{}", node.id);
+                        let w = (text.len() as f64 * 0.6).max(4.0);
+                        (text, w)
+                    }
+                    "truncated" => {
+                        let max_chars = 12;
+                        let text = if node.label.len() > max_chars {
+                            format!("{}…", &node.label[..max_chars])
+                        } else {
+                            node.label.clone()
+                        };
+                        let w = (text.len() as f64 * 0.6).max(4.0);
+                        (text, w)
+                    }
+                    _ => {
+                        // "label" mode (full label)
+                        let w = (node.label.len() as f64 * 0.6).max(4.0);
+                        (node.label.clone(), w)
+                    }
+                };
 
-                if sx + node_w < 0.0 || sx > canvas_w || sy + node_h < 0.0 || sy > canvas_h {
+                let sx = pos.x * (canvas_w / world_w) * zoom + offset_x;
+                let sy = pos.y * (canvas_h / world_h) * zoom + offset_y;
+
+                if sx + display_width < 0.0 || sx > canvas_w || sy + node_h < 0.0 || sy > canvas_h {
                     continue;
                 }
 
@@ -343,7 +447,7 @@ fn render_canvas<'a>(
                     ctx.draw(&Rectangle {
                         x: sx - 0.5,
                         y: sy - 0.5,
-                        width: node_w + 1.0,
+                        width: display_width + 1.0,
                         height: node_h + 1.0,
                         color: border_color,
                     });
@@ -352,14 +456,14 @@ fn render_canvas<'a>(
                 ctx.draw(&Rectangle {
                     x: sx,
                     y: sy,
-                    width: node_w,
+                    width: display_width,
                     height: node_h,
                     color,
                 });
 
                 let text_color = if search_match { Color::Magenta } else { color };
                 let label_line = TextLine::from(vec![Span::styled(
-                    node.label.clone(),
+                    display_text.clone(),
                     Style::default().fg(text_color),
                 )]);
                 ctx.print(sx + 0.5, sy + 0.5, label_line);
@@ -476,6 +580,12 @@ fn render_status<'a>(state: &AppState) -> Paragraph<'a> {
         }
     };
 
+    // Display mode info.
+    let display_info = format!("display: {}", state.display_mode);
+
+    // Zoom level.
+    let zoom_info = format!("zoom: {:.1}x", state.zoom);
+
     // Search info.
     let search_info = if state.search_active && !state.search_query.is_empty() {
         format!("/{}", state.search_query)
@@ -486,9 +596,9 @@ fn render_status<'a>(state: &AppState) -> Paragraph<'a> {
     };
 
     // Keybinding hints.
-    let hints = "↑↓←→ select  ↵ details  t filter  / search  q quit";
+    let hints = "↑↓←→ select  ↵ details  t filter  i display  +/- zoom  / search  q quit";
 
-    let mut parts: Vec<String> = vec![node_info, filter_info.to_string()];
+    let mut parts: Vec<String> = vec![node_info, display_info, zoom_info, filter_info.to_string()];
     if !search_info.is_empty() {
         parts.push(search_info);
     }
@@ -549,6 +659,38 @@ fn event_loop(
     state: &mut AppState,
 ) -> Result<()> {
     loop {
+        // Auto-set focus to first visible node on startup
+        if state.focus_idx.is_none() && !state.nodes.is_empty() {
+            state.focus_idx = Some(0);
+            state.selected_idx = Some(0);
+        }
+
+        // Re-center if needed (after zoom or focus change)
+        if state.needs_recenter {
+            recenter_on_selected(state);
+            state.needs_recenter = false;
+        }
+
+        // Compute canvas area for dimension tracking
+        let term_size = terminal.size().ok();
+        if let Some(size) = term_size {
+            let area = ratatui::prelude::Rect::new(0, 0, size.width, size.height);
+            let vert = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+            let horiz = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+                .split(vert[1]);
+            state.last_canvas_w = horiz[0].width.max(1) as f64;
+            state.last_canvas_h = horiz[0].height.max(1) as f64;
+        }
+
         // --- Render ---
         terminal.draw(|f| {
             let area = f.area();
@@ -582,11 +724,14 @@ fn event_loop(
                 state.edges.clone(),
                 state.positions.clone(),
                 state.selected_idx,
+                state.focus_idx,
                 state.filter_type.clone(),
                 state.search_query.clone(),
                 state.search_active,
                 state.offset_x,
                 state.offset_y,
+                state.display_mode.clone(),
+                state.zoom,
                 horiz[0],
             );
             f.render_widget(canvas_widget, horiz[0]);
@@ -649,9 +794,12 @@ fn handle_key(state: &mut AppState, code: KeyCode) -> bool {
             false
         }
         KeyCode::Enter => {
-            // Enter already selects — this is a no-op for now (details panel
-            // already shows the selected node).  Could be extended to "open"
-            // the node.
+            if let Some(sel) = state.selected_idx {
+                if state.focus_idx != Some(sel) {
+                    state.focus_idx = Some(sel);
+                    state.needs_recenter = true;
+                }
+            }
             false
         }
         KeyCode::Char('t') => {
@@ -661,6 +809,20 @@ fn handle_key(state: &mut AppState, code: KeyCode) -> bool {
         KeyCode::Char('/') => {
             state.search_active = true;
             state.search_query.clear();
+            false
+        }
+        KeyCode::Char('i') => {
+            cycle_display_mode(state);
+            false
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            state.zoom = (state.zoom + 0.2).min(3.0);
+            state.needs_recenter = true;
+            false
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            state.zoom = (state.zoom - 0.2).max(0.3);
+            state.needs_recenter = true;
             false
         }
         _ => false,
@@ -753,6 +915,15 @@ fn cycle_filter(state: &mut AppState) {
     state.filter_type = next.map(String::from);
 }
 
+/// Cycle the display mode through: id → truncated → label → id …
+fn cycle_display_mode(state: &mut AppState) {
+    state.display_mode = match state.display_mode.as_str() {
+        "id" => "truncated".to_string(),
+        "truncated" => "label".to_string(),
+        _ => "id".to_string(),
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -828,12 +999,18 @@ mod tests {
                 Position { x: 400.0, y: 100.0 },
             ],
             selected_idx: None,
+            focus_idx: Some(0),
             filter_type: None,
             search_query: String::new(),
             search_active: false,
             offset_x: 0.0,
             offset_y: 0.0,
             depth: 2,
+            display_mode: "id".to_string(),
+            zoom: 1.0,
+            last_canvas_w: 80.0,
+            last_canvas_h: 40.0,
+            needs_recenter: false,
         }
     }
 
@@ -848,6 +1025,7 @@ mod tests {
         assert!(state.edges.is_empty());
         assert!(state.positions.is_empty());
         assert_eq!(state.selected_idx, None);
+        assert_eq!(state.focus_idx, None);
         assert_eq!(state.filter_type, None);
         assert!(state.search_query.is_empty());
         assert!(!state.search_active);
@@ -864,7 +1042,12 @@ mod tests {
     fn test_visible_nodes_no_filter() {
         let state = test_state();
         let visible = visible_nodes(&state);
-        assert_eq!(visible.len(), 5, "all 5 nodes should be visible");
+        // Focus on Python (idx 0): neighbors are Rust (idx 1) and tutorial (idx 3)
+        assert_eq!(
+            visible.len(),
+            3,
+            "focus node + 2 neighbors should be visible"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -876,7 +1059,9 @@ mod tests {
         let mut state = test_state();
         state.filter_type = Some("note".into());
         let visible = visible_nodes(&state);
-        assert_eq!(visible.len(), 2, "only 2 note-type nodes");
+        // Focus on Python (idx 0, note type). Visible neighbors: Rust (entity), tutorial (tag).
+        // With note filter, only Python itself remains.
+        assert_eq!(visible.len(), 1, "only Python (note) among visible set");
         for &i in &visible {
             assert_eq!(state.nodes[i].type_, "note");
         }
@@ -889,12 +1074,14 @@ mod tests {
     #[test]
     fn test_visible_edges_filtered() {
         let mut state = test_state();
-        // Filter to "note" only: nodes 1 (Python) and 5 (Async).
+        // Focus on Rust (idx 1, entity). Neighbors: Python (note), Tokio (entity), Async (note).
+        state.focus_idx = Some(1);
+        // Filter to "note" only: Python (idx 0) and Async (idx 4) are visible.
         state.filter_type = Some("note".into());
         let visible = visible_edges(&state);
-        // Edges whose both endpoints are notes:
-        //   None — because no edge connects two notes directly.
-        // Edge 1→2 (Python→Rust) has Rust which is entity → filtered out.
+        // Edges whose both endpoints are notes visible from Rust:
+        //   None — because no edge connects two notes directly
+        //   (Async→Rust has Rust which is entity → filtered out of visible set)
         // So the result should be empty.
         assert_eq!(visible.len(), 0, "no edges between two notes");
     }
@@ -902,10 +1089,12 @@ mod tests {
     #[test]
     fn test_visible_edges_with_entity_filter() {
         let mut state = test_state();
-        // Filter to "entity" only: nodes 2 (Rust), 3 (Tokio).
+        // Focus on Rust (idx 1, entity). Neighbors: Python (note), Tokio (entity), Async (note).
+        state.focus_idx = Some(1);
+        // Filter to "entity" only: Rust (idx 1) and Tokio (idx 2) are visible.
         state.filter_type = Some("entity".into());
         let visible = visible_edges(&state);
-        // Edge 2→3 (Rust→Tokio) has both endpoints as entities → visible.
+        // Edge 2→3 (Rust→Tokio, "depends") has both endpoints as entities → visible.
         assert_eq!(visible.len(), 1, "one edge between two entities");
         assert_eq!(state.edges[visible[0]].type_, "depends");
     }
