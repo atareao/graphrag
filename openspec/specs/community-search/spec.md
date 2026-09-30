@@ -57,6 +57,13 @@ The generator SHALL be exposed as a reusable function that accepts generation op
 - **WHEN** the user runs `graphrag search --answer "asdasdasdasd" test.db`
 - **THEN** the command SHALL display: "No relevant information found for your query."
 
+#### Scenario: Answer mode uses the configured generation model
+
+- **GIVEN** a config with `summary_model = "llama3.2:3b"` and `embed_model = "bge-m3"`
+- **WHEN** the user runs `graphrag search --answer "query" test.db`
+- **THEN** answer generation SHALL use `summary_model`, not the embedding model
+- **AND** the command SHALL produce a non-empty narrative answer
+
 ### Requirement: Answer mode respects context window limits
 
 To avoid exceeding the LLM context window, the generator SHALL default to:

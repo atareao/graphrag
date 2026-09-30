@@ -416,6 +416,7 @@ fn main() -> Result<()> {
             } else {
                 &embed_model
             };
+            let summary_model = cfg.summary_model.clone();
             debug!(
                 "Comando: search query='{}', k={}, depth={}",
                 query, k, depth
@@ -428,6 +429,7 @@ fn main() -> Result<()> {
                 alpha_val,
                 ollama_url,
                 embed_model,
+                &summary_model,
                 min_weight,
                 notes_only,
                 &filter,
@@ -857,6 +859,9 @@ fn cmd_build(
     Ok(())
 }
 
+/// Run a hybrid search. When `answer` is true, additionally generate a narrative
+/// RAG answer using `summary_model` (the configured generation model) as the
+/// Ollama generator; `embed_model` is used only for query embeddings.
 #[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: &str,
@@ -866,6 +871,7 @@ fn cmd_search(
     alpha: f64,
     ollama_url: &str,
     embed_model: &str,
+    summary_model: &str,
     min_weight: Option<f64>,
     notes_only: bool,
     filter: &[String],
@@ -952,7 +958,7 @@ fn cmd_search(
             query,
             &results,
             &community_embeddings,
-            embed_model,
+            summary_model,
             &crate::community::search::AnswerOptions::default(),
         ) {
             Ok(answer) => {
@@ -1614,6 +1620,44 @@ mod tests {
                 .iter()
                 .all(|s| s.get("label").is_some() && s.get("path").is_some()),
             "each source must expose label and path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regression — `search --answer` must use the generation model
+    // (`summary_model`), not the embedding model. Requires Ollama.
+    // Run with `cargo test -- --ignored test_cmd_search_answer_end_to_end`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "needs Ollama running"]
+    fn test_cmd_search_answer_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("demo.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        crate::seed::demo_data::create_demo_db(&db, "http://localhost:11434", "bge-m3:latest")
+            .expect("seed demo db");
+
+        let res = cmd_search(
+            "nginx",
+            &db,
+            3,
+            2,
+            0.7,
+            "http://localhost:11434",
+            "bge-m3:latest",
+            "llama3.2:3b",
+            None,
+            false,
+            &[],
+            true,
+            &OutputFormat::List,
+        );
+
+        assert!(
+            res.is_ok(),
+            "cmd_search --answer must succeed (generation model = summary_model): {res:?}"
         );
     }
 }
