@@ -699,8 +699,9 @@ fn handle_tool_search_answer(args: &Value, state: &McpState) -> Result<String> {
         &results,
         &community_embeddings,
         summary_model,
+        &community::search::AnswerOptions::default(),
     )?;
-    Ok(answer)
+    Ok(answer.answer)
 }
 
 // ---------------------------------------------------------------------------
