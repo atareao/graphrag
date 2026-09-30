@@ -172,7 +172,8 @@ fn resolve_node_ids(conn: &Connection, from: Option<&str>, depth: i32) -> Result
             // Look up the starting node.
             let node_id: i64 = conn
                 .query_row(
-                    "SELECT id FROM nodes WHERE label = ?1",
+                    "SELECT id FROM nodes WHERE key = ?1 OR label = ?1 \
+                     ORDER BY (key = ?1) DESC, id ASC LIMIT 1",
                     rusqlite::params![label],
                     |row| row.get(0),
                 )
@@ -332,16 +333,16 @@ mod tests {
 
         // Insert test nodes (mix of normal, root, and system).
         conn.execute_batch(
-            "INSERT INTO nodes (id, label, type) VALUES
-                 (10, 'Python',    'language'),
-                 (11, 'Rust',      'language'),
-                 (12, 'PostgreSQL','database'),
-                 (13, 'Docker',    'tool'),
-                 (14, 'SQLAlchemy','library'),
-                 (15, 'Actix',     'library'),
-                 (16, 'Tokio',     'library'),
-                 (20, '_root',     'root'),
-                 (21, '_system',   'system');
+            "INSERT INTO nodes (id, key, label, type) VALUES
+                 (10, 'node:Python',    'Python',    'language'),
+                 (11, 'node:Rust',      'Rust',      'language'),
+                 (12, 'node:PostgreSQL','PostgreSQL','database'),
+                 (13, 'node:Docker',    'Docker',    'tool'),
+                 (14, 'node:SQLAlchemy','SQLAlchemy','library'),
+                 (15, 'node:Actix',     'Actix',     'library'),
+                 (16, 'node:Tokio',     'Tokio',     'library'),
+                 (20, 'node:_root',     '_root',     'root'),
+                 (21, 'node:_system',   '_system',   'system');
              INSERT INTO edges (source_id, target_id, type, weight, context) VALUES
                  (10, 14, 'uses',     0.9, 'Python projects use SQLAlchemy for ORM'),
                  (14, 12, 'connects', 0.8, 'SQLAlchemy connects to PostgreSQL'),

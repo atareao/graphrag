@@ -7,22 +7,141 @@
 //! # Pipeline
 //!
 //! 1. Compute a query embedding via `OllamaClient::embed()`
-//! 2. Find top-3 communities by cosine similarity against community embeddings
+//! 2. Find the top-N communities by cosine similarity against community
+//!    embeddings (N configurable via [`AnswerOptions::communities`], default 3)
 //! 3. Format community summaries as context
-//! 4. Take top-5 hybrid search results as chunk evidence
+//! 4. Take the top-M hybrid search results as chunk evidence
+//!    (M configurable via [`AnswerOptions::evidence`], default 5)
 //! 5. Build a prompt combining community context + chunk evidence + query
 //! 6. Call `OllamaClient::generate()` with no format restriction
-//! 7. Return the generated answer text
+//! 7. Return an [`AnswerResult`] with the answer text and its deduplicated
+//!    [`Source`] list
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::embed::ollama::OllamaClient;
 use crate::search::hybrid::SearchResult;
 use crate::vector;
 
 // ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Controls how much context is packed into the RAG prompt.
+///
+/// All counts are upper bounds; the generator never emits more than this.
+#[derive(Debug, Clone)]
+pub struct AnswerOptions {
+    /// Maximum number of community summaries to include.
+    pub communities: usize,
+    /// Maximum number of chunk evidences to include.
+    pub evidence: usize,
+    /// Maximum characters per community summary.
+    pub summary_chars: usize,
+    /// Maximum characters per chunk evidence.
+    pub chunk_chars: usize,
+}
+
+impl Default for AnswerOptions {
+    fn default() -> Self {
+        Self {
+            communities: 3,
+            evidence: 5,
+            summary_chars: 500,
+            chunk_chars: 300,
+        }
+    }
+}
+
+/// A single source note backing a generated answer.
+#[derive(Debug, Clone, Serialize)]
+pub struct Source {
+    /// Display label of the source note.
+    pub label: String,
+    /// Filesystem path of the source note, when known.
+    pub path: Option<String>,
+}
+
+/// Structured result of an answer generation.
+#[derive(Debug, Clone)]
+pub struct AnswerResult {
+    /// The generated narrative answer.
+    pub answer: String,
+    /// Deduplicated list of source notes, in score order.
+    pub sources: Vec<Source>,
+}
+
+impl AnswerResult {
+    /// Derive the deduplicated source list from hybrid search results.
+    ///
+    /// Deduplication key is the note `path` when present, otherwise the
+    /// `label`. Input order (score order) is preserved.
+    pub fn sources_from_results(results: &[SearchResult]) -> Vec<Source> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut sources: Vec<Source> = Vec::new();
+
+        for r in results {
+            let key = if r.file.is_empty() {
+                r.label.clone()
+            } else {
+                r.file.clone()
+            };
+            if seen.insert(key) {
+                sources.push(Source {
+                    label: r.label.clone(),
+                    path: if r.file.is_empty() {
+                        None
+                    } else {
+                        Some(r.file.clone())
+                    },
+                });
+            }
+        }
+
+        sources
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Build the full RAG prompt for a query from community summaries and chunk
+/// evidence, honouring the provided [`AnswerOptions`].
+///
+/// This is a pure function: it performs no I/O and can be tested without
+/// Ollama. When `communities` is empty the community section is omitted.
+pub fn build_rag_prompt(
+    query: &str,
+    communities: &[(String, String)],
+    results: &[SearchResult],
+    opts: &AnswerOptions,
+) -> String {
+    // ---- Communities: top-N, summaries truncated to `summary_chars` ----
+    let truncated: Vec<(String, String)> = communities
+        .iter()
+        .take(opts.communities)
+        .map(|(label, summary)| (label.clone(), truncate_chars(summary, opts.summary_chars)))
+        .collect();
+    let community_refs: Vec<(&str, &str)> = truncated
+        .iter()
+        .map(|(label, summary)| (label.as_str(), summary.as_str()))
+        .collect();
+    let community_context = format_community_context(&community_refs);
+
+    // ---- Chunk evidence: top-M by score, truncated to `chunk_chars` ----
+    let mut sorted_results: Vec<&SearchResult> = results.iter().collect();
+    sorted_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_results: Vec<&SearchResult> = sorted_results.into_iter().take(opts.evidence).collect();
+    let chunk_evidence = format_chunk_evidence_limited(&top_results, opts.chunk_chars);
+
+    build_answer_prompt(&community_context, &chunk_evidence, query)
+}
 
 /// Generate an answer using community summaries + chunk evidence as RAG context.
 ///
@@ -36,28 +155,34 @@ use crate::vector;
 ///   [`crate::db::communities::load_all_community_embeddings`]).
 /// * `summary_model`  — The Ollama model to use for answer generation
 ///   (e.g. `"llama3.2:3b"`).
+/// * `opts`           — Generation options (counts and truncation limits).
 ///
 /// # Returns
 ///
-/// The generated answer text, or `"No relevant information found."` if there
-/// are no communities or no results to use as context.
+/// An [`AnswerResult`] with the generated answer and the deduplicated source
+/// list. With empty `results` the answer is `"No relevant information found."`.
 pub fn answer_query(
     ollama: &OllamaClient,
     query: &str,
     results: &[SearchResult],
     community_embeddings: &[(i64, Vec<f32>, String, String)],
     summary_model: &str,
-) -> Result<String> {
+    opts: &AnswerOptions,
+) -> Result<AnswerResult> {
     // Bail early if there is nothing to work with.
     if results.is_empty() {
-        return Ok("No relevant information found.".into());
+        return Ok(AnswerResult {
+            answer: "No relevant information found.".into(),
+            sources: Vec::new(),
+        });
     }
+
+    let sources = AnswerResult::sources_from_results(results);
 
     // ---- Step 1: Compute query embedding ----
     let query_emb = ollama.embed(query)?;
 
-    // ---- Step 2: Find top-3 communities by cosine similarity ----
-    let top_k = 3;
+    // ---- Step 2: Find top-N communities by cosine similarity ----
     let mut scored: Vec<(f32, &str, &str)> = community_embeddings
         .iter()
         .map(|(_id, emb, label, summary)| {
@@ -66,37 +191,22 @@ pub fn answer_query(
         })
         .collect();
 
-    // Sort descending by similarity and take top-k.
+    // Sort descending by similarity and take top-N.
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    let top_communities: Vec<(&str, &str)> = scored
+    let top_communities: Vec<(String, String)> = scored
         .into_iter()
-        .take(top_k)
+        .take(opts.communities)
         .filter(|(sim, _, _)| *sim > 0.0)
-        .map(|(_, label, summary)| (label, summary))
+        .map(|(_, label, summary)| (label.to_string(), summary.to_string()))
         .collect();
 
-    // ---- Step 3: Format community context ----
-    let community_context = format_community_context(&top_communities);
+    // ---- Step 3: Build the prompt (communities + evidence + query) ----
+    let prompt = build_rag_prompt(query, &top_communities, results, opts);
 
-    // ---- Step 4: Find top-5 results by score ----
-    let mut sorted_results: Vec<&SearchResult> = results.iter().collect();
-    sorted_results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let top_results: Vec<&SearchResult> = sorted_results.into_iter().take(5).collect();
-
-    // ---- Step 5: Format chunk evidence ----
-    let chunk_evidence = format_chunk_evidence(&top_results);
-
-    // ---- Step 6: Build prompt ----
-    let prompt = build_answer_prompt(&community_context, &chunk_evidence, query);
-
-    // ---- Step 7: Call Ollama generate (no JSON mode) ----
+    // ---- Step 4: Call Ollama generate (no JSON mode) ----
     let answer = ollama.generate(&prompt, summary_model, None)?;
 
-    Ok(answer)
+    Ok(AnswerResult { answer, sources })
 }
 
 // ---------------------------------------------------------------------------
@@ -143,18 +253,19 @@ fn format_community_context(communities: &[(&str, &str)]) -> String {
 /// Note: {label} > {chunk_header}
 /// {chunk_text_preview}
 /// ```
+#[allow(dead_code)] // exercised by unit tests; the generator uses the configurable variant
 fn format_chunk_evidence(results: &[&SearchResult]) -> String {
-    let max_chars: usize = 300;
+    format_chunk_evidence_limited(results, 300)
+}
 
+/// Like [`format_chunk_evidence`] but with a configurable per-chunk character
+/// limit. Shared by the default path and [`build_rag_prompt`].
+fn format_chunk_evidence_limited(results: &[&SearchResult], max_chars: usize) -> String {
     let entries: Vec<String> = results
         .iter()
         .filter(|r| !r.chunk_text.is_empty())
         .map(|r| {
-            let preview = if r.chunk_text.len() <= max_chars {
-                r.chunk_text.clone()
-            } else {
-                format!("{}...", &r.chunk_text[..max_chars])
-            };
+            let preview = truncate_chars(&r.chunk_text, max_chars);
             format!("Note: {} > {}\n{}", r.label, r.chunk_header, preview)
         })
         .collect();
@@ -166,6 +277,17 @@ fn format_chunk_evidence(results: &[&SearchResult]) -> String {
     let mut out = String::from("## Relevant Notes\n\n");
     out.push_str(&entries.join("\n\n"));
     out
+}
+
+/// Truncate a string to at most `max_chars` Unicode scalar values, appending
+/// `"..."` when truncation occurred. Char-safe (never splits a UTF-8 boundary).
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
 }
 
 /// Build the full answer prompt by combining community context, chunk
@@ -414,11 +536,222 @@ mod tests {
     fn test_answer_query_empty_results() {
         // When results is empty, answer_query should return "No relevant information found."
         let ollama = OllamaClient::new("http://localhost:11434", "nomic-embed-text");
-        let result = answer_query(&ollama, "test", &[], &[], "llama3.2:3b");
+        let result = answer_query(
+            &ollama,
+            "test",
+            &[],
+            &[],
+            "llama3.2:3b",
+            &AnswerOptions::default(),
+        );
         assert_eq!(
-            result.unwrap(),
+            result.unwrap().answer,
             "No relevant information found.",
             "empty results should produce the 'no info' message"
+        );
+    }
+
+    // ==================================================================
+    // RED — add-ask-rag-command (community-search delta)
+    //
+    // These tests target the NEW public API of this module and therefore
+    // do not compile until the GREEN phase lands:
+    //   * `AnswerOptions`    — generation options (counts + truncation)
+    //   * `AnswerResult`     — { answer, sources }
+    //   * `Source`           — { label, path }
+    //   * `AnswerResult::sources_from_results(&[SearchResult]) -> Vec<Source>`
+    //   * `build_rag_prompt(query, communities, results, opts) -> String`
+    // ==================================================================
+
+    /// Build a note `SearchResult` that carries a file path (unlike
+    /// [`make_result`], which leaves `file` empty).
+    fn make_note_result(
+        label: &str,
+        path: &str,
+        chunk_header: &str,
+        chunk_text: &str,
+    ) -> SearchResult {
+        let mut r = make_result(label, 0.8, chunk_header, chunk_text);
+        r.file = path.to_string();
+        r
+    }
+
+    // ------------------------------------------------------------------
+    // RED-1 — AnswerResult.sources is deduplicated per note
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_answer_result_sources_deduplicated() {
+        // 3 distinct notes; the first note contributes 2 chunks that must
+        // collapse into a single source entry.
+        let results = vec![
+            make_note_result("nginx", "/notes/nginx.md", "Setup", "server { listen 80; }"),
+            make_note_result(
+                "nginx",
+                "/notes/nginx.md",
+                "TLS",
+                "ssl_certificate /etc/ssl/cert.pem;",
+            ),
+            make_note_result(
+                "docker",
+                "/notes/docker.md",
+                "Intro",
+                "Docker runs containers.",
+            ),
+            make_note_result("rust", "/notes/rust.md", "Ownership", "Rust owns memory."),
+        ];
+
+        let sources = AnswerResult::sources_from_results(&results);
+
+        assert_eq!(
+            sources.len(),
+            3,
+            "one source per distinct note, no duplicates even with 2 chunks of 'nginx'"
+        );
+
+        let unique: std::collections::HashSet<&str> =
+            sources.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(unique.len(), 3, "all source labels must be unique");
+
+        // label + path must both be populated for the duplicate note.
+        let nginx = sources
+            .iter()
+            .find(|s| s.label == "nginx")
+            .expect("nginx must appear once");
+        assert_eq!(
+            nginx.path.as_deref(),
+            Some("/notes/nginx.md"),
+            "source path must point at the underlying note"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // RED-2 — AnswerOptions are configurable (pure prompt builder)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rag_prompt_respects_options() {
+        let opts = AnswerOptions {
+            communities: 1,
+            evidence: 3,
+            ..AnswerOptions::default()
+        };
+
+        let communities = vec![
+            (
+                "ai-ml".to_string(),
+                "Artificial intelligence and machine learning.".to_string(),
+            ),
+            (
+                "web-dev".to_string(),
+                "Web development frameworks.".to_string(),
+            ),
+            (
+                "databases".to_string(),
+                "Database technologies.".to_string(),
+            ),
+        ];
+
+        let results = vec![
+            make_note_result("nginx", "/notes/nginx.md", "Setup", "server { listen 80; }"),
+            make_note_result(
+                "docker",
+                "/notes/docker.md",
+                "Intro",
+                "Docker runs containers.",
+            ),
+            make_note_result("rust", "/notes/rust.md", "Ownership", "Rust owns memory."),
+            make_note_result("sqlite", "/notes/sqlite.md", "FTS", "SQLite FTS5 search."),
+            make_note_result("linux", "/notes/linux.md", "Systemd", "systemd unit files."),
+        ];
+
+        let prompt = build_rag_prompt("nginx", &communities, &results, &opts);
+
+        assert_eq!(
+            prompt.matches("Community: ").count(),
+            1,
+            "opts.communities = 1 must include exactly one community summary"
+        );
+        assert_eq!(
+            prompt.matches("Note: ").count(),
+            3,
+            "opts.evidence = 3 must include exactly three chunk evidences"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // RED-3 — graceful degradation when there are no communities
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_rag_prompt_without_communities() {
+        let results = vec![
+            make_note_result("nginx", "/notes/nginx.md", "Setup", "server { listen 80; }"),
+            make_note_result(
+                "docker",
+                "/notes/docker.md",
+                "Intro",
+                "Docker runs containers.",
+            ),
+        ];
+
+        let prompt = build_rag_prompt("nginx", &[], &results, &AnswerOptions::default());
+
+        assert!(
+            !prompt.contains("Related Knowledge Communities"),
+            "prompt must NOT contain a community section when there are no communities"
+        );
+        assert!(
+            prompt.contains("Relevant Notes"),
+            "prompt must still build chunk evidence"
+        );
+        assert_eq!(prompt.matches("Note: ").count(), 2);
+        assert!(prompt.contains("Question: nginx"));
+    }
+
+    // ------------------------------------------------------------------
+    // RED-6 — end-to-end (requires Ollama; run with `cargo test -- --ignored`)
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "requires Ollama with nomic-embed-text and llama3.2:3b"]
+    #[allow(clippy::len_zero)]
+    fn test_ask_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("demo.db");
+        let db = db_path.to_str().expect("utf-8 path");
+
+        crate::seed::demo_data::create_demo_db(db, "http://localhost:11434", "nomic-embed-text")
+            .expect("seed demo db");
+
+        let ollama = OllamaClient::new("http://localhost:11434", "nomic-embed-text");
+        let mut hs = crate::search::HybridSearch::new(db, ollama.clone()).expect("hybrid search");
+        let results = hs
+            .hybrid_search("nginx", 5, 2, 0.7, None, false, &[])
+            .expect("hybrid_search");
+        assert!(
+            !results.is_empty(),
+            "demo db should yield results for 'nginx'"
+        );
+
+        let conn = rusqlite::Connection::open(db).expect("open db");
+        let communities =
+            crate::db::communities::load_all_community_embeddings(&conn).unwrap_or_default();
+
+        let answer = answer_query(
+            &ollama,
+            "nginx",
+            &results,
+            &communities,
+            "llama3.2:3b",
+            &AnswerOptions::default(),
+        )
+        .expect("answer generation");
+
+        assert!(!answer.answer.trim().is_empty(), "answer must be non-empty");
+        assert!(
+            answer.sources.len() >= 1,
+            "answer must report at least one source"
         );
     }
 }

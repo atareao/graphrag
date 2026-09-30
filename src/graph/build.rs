@@ -5,12 +5,14 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use walkdir::WalkDir;
 
 use crate::chunking::{chunk_document, parse_frontmatter, slugify};
+use crate::db::keys::{node_key, note_key};
 use crate::db::schema;
 use crate::embed::ollama::OllamaClient;
 use crate::ner::{extract_entities_batch, Entity, DEFAULT_LABELS};
@@ -58,6 +60,38 @@ struct FileResult {
     tags: Vec<String>,
 }
 
+/// Load existing note hashes from the database.
+///
+/// Returns a map of relative path → (sha256 hash, node_id) for all existing
+/// note nodes that have both `hash` and `path` fields in their JSON metadata.
+/// Notes without these fields (e.g., from an older graphrag version) are
+/// silently excluded — they will be reprocessed and updated with the fields
+/// on the next build.
+pub fn collect_existing_hashes(conn: &Connection) -> Result<HashMap<String, (String, i64)>> {
+    // Mapa: ruta_relativa → (hash, id_del_nodo)
+    let mut existing: HashMap<String, (String, i64)> = HashMap::new();
+    let mut stmt = conn.prepare("SELECT id, label, metadata FROM nodes WHERE type = 'note'")?;
+    let rows = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        let label: String = row.get(1)?;
+        let meta_str: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        Ok((id, label, meta_str))
+    })?;
+
+    for row in rows {
+        let (id, _label, meta_str) = row?;
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            if let Some(hash) = meta.get("hash").and_then(|h| h.as_str()) {
+                if let Some(path) = meta.get("path").and_then(|p| p.as_str()) {
+                    existing.insert(path.to_string(), (hash.to_string(), id));
+                }
+            }
+        }
+    }
+
+    Ok(existing)
+}
+
 /// Construye un grafo de conocimiento desde un directorio de notas Markdown.
 ///
 /// # Flujo
@@ -99,39 +133,53 @@ pub fn build_graph(
     }
 
     // ── Inicializar base de datos ──────────────────────────────────────────
+    // Si la BD venía de WAL mode (versiones anteriores), la transición a
+    // DELETE la gestiona SQLite de forma segura (checkpoint automático al
+    // cambiar `PRAGMA journal_mode`). NO borrar los ficheros `-wal`/`-shm`
+    // a mano: hacerlo puede perder datos ya confirmados.
     let conn = Connection::open(db_path)
         .with_context(|| format!("No se pudo abrir base de datos: {}", db_path))?;
     schema::init_db(&conn)?;
 
     conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
+        "PRAGMA synchronous=NORMAL;
          PRAGMA cache_size=-64000;",
     )?;
 
-    // ── Cargar hashes existentes de la BD ────────────────────────────────
-    // Mapa: ruta_relativa → (hash, id_del_nodo)
-    let mut existing: HashMap<String, (String, i64)> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT id, label, metadata FROM nodes WHERE type = 'note'")?;
-        let rows = stmt.query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let label: String = row.get(1)?;
-            let meta_str: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
-            Ok((id, label, meta_str))
-        })?;
-
-        for row in rows {
-            let (id, _label, meta_str) = row?;
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                if let Some(hash) = meta.get("hash").and_then(|h| h.as_str()) {
-                    if let Some(path) = meta.get("path").and_then(|p| p.as_str()) {
-                        existing.insert(path.to_string(), (hash.to_string(), id));
-                    }
-                }
-            }
+    // Verificar que el journal mode es DELETE
+    if let Ok(mode) = conn.query_row::<String, _, _>("PRAGMA journal_mode", [], |r| r.get(0)) {
+        log::debug!("Main connection journal_mode: {}", mode);
+        if mode.to_lowercase() != "delete" {
+            log::warn!("Journal mode es '{}', no 'delete'. Forzando...", mode);
+            let _ = conn.execute_batch("PRAGMA journal_mode=DELETE;");
         }
     }
+
+    // ── Instalar manejador SIGINT (Ctrl+C) ─────────────────────────────
+    // Dos etapas:
+    //   1ª Ctrl+C: flag de interrupción → writer checkea flag, corta
+    //   2ª Ctrl+C: exit inmediato (workers en llamadas Ollama lentas)
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let sigint_flag = interrupted.clone();
+    let second_signal = Arc::new(AtomicBool::new(false));
+    let second_flag = second_signal.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        if second_flag.load(Ordering::SeqCst) {
+            // Segundo Ctrl+C: avisar que ya estamos parando
+            eprintln!("⚠️  Ya estamos terminando. Espera a que los workers acaben su NER actual.");
+            return;
+        }
+        // Primer Ctrl+C: flag para shutdown graceful
+        sigint_flag.store(true, Ordering::SeqCst);
+        eprintln!("\n⚠️  Recibida señal de interrupción. Terminando archivo actual...");
+        eprintln!("⚠️  Presiona Ctrl+C de nuevo para ver este mensaje.");
+        second_flag.store(true, Ordering::SeqCst);
+    }) {
+        log::warn!("No se pudo instalar manejador SIGINT: {}", e);
+    }
+
+    // ── Cargar hashes existentes de la BD ────────────────────────────────
+    let existing = collect_existing_hashes(&conn)?;
 
     let total_files = existing.len();
     info!("Notas existentes en BD: {}", total_files);
@@ -162,16 +210,15 @@ pub fn build_graph(
         anyhow::bail!("No se encontraron archivos .md en {}", repo_path);
     }
 
-    // ── Barra de progreso ──────────────────────────────────────────────────
-    let pb = Mutex::new(ProgressBar::new(total as u64));
-    pb.lock().unwrap().set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({per_sec:.yellow}, ETA: {eta})")
-            .unwrap()
-            .progress_chars("━╸━"),
-    );
-
     // ── Pre-examen: identificar archivos nuevos o modificados ──────────────
+    let pre_spinner = ProgressBar::new_spinner();
+    pre_spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.yellow} {msg}")
+            .unwrap(),
+    );
+    pre_spinner.set_message(format!("🔍 Comparando hashes: 0/{}", total));
+    let mut examined: usize = 0;
     let mut to_process: Vec<&Path> = Vec::new();
     for entry in &md_files {
         let md_path = entry.path();
@@ -181,7 +228,8 @@ pub fn build_graph(
         let text = match std::fs::read_to_string(md_path) {
             Ok(t) => t,
             Err(_) => {
-                pb.lock().unwrap().inc(1);
+                examined += 1;
+                pre_spinner.set_message(format!("🔍 Comparando hashes: {}/{}", examined, total));
                 continue;
             }
         };
@@ -197,11 +245,14 @@ pub fn build_graph(
         if let Some((stored_hash, _)) = existing.get(&relative_str) {
             if *stored_hash == file_hash {
                 debug!("Archivo sin cambios, saltando: {}", relative_str);
-                pb.lock().unwrap().inc(1);
+                examined += 1;
+                pre_spinner.set_message(format!("🔍 Comparando hashes: {}/{}", examined, total));
                 continue;
             }
         }
 
+        examined += 1;
+        pre_spinner.set_message(format!("🔍 Comparando hashes: {}/{}", examined, total));
         to_process.push(md_path);
     }
 
@@ -211,9 +262,19 @@ pub fn build_graph(
         total_to_process
     );
 
-    // Ajustar la barra de progreso al número real de archivos a procesar
-    pb.lock().unwrap().set_length(total_to_process as u64);
-    pb.lock().unwrap().reset();
+    pre_spinner.finish_with_message(format!(
+        "✅ Pre-examen completado: {} archivos a procesar",
+        total_to_process
+    ));
+
+    // ── Barra de progreso principal ──────────────────────────────────────
+    let pb = Mutex::new(ProgressBar::new(total_to_process as u64));
+    pb.lock().unwrap().set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg} ({per_sec:.yellow}, ETA: {eta})")
+            .unwrap()
+            .progress_chars("━╸━"),
+    );
 
     // ── Procesamiento paralelo ────────────────────────────────────────────
     // Workers: leen archivos, parsean frontmatter, chunk, llaman a Ollama.
@@ -245,6 +306,7 @@ pub fn build_graph(
 
     // Directorios a saltar para relaciones estructurales
     let skip_dirs = ["notas", "muestra"];
+    let interrupted = &interrupted;
 
     std::thread::scope(|s| {
         // ── Writer thread ──────────────────────────────────────────────
@@ -257,15 +319,19 @@ pub fn build_graph(
                     return;
                 }
             };
-            if let Err(e) = schema::init_db(&conn) {
-                log::error!("Error inicializando schema writer: {}", e);
-                return;
-            }
+            // NO llamamos a schema::init_db — la conexión principal ya creó
+            // las tablas. Solo configuramos PRAGMAs.
             conn.execute_batch(
-                "PRAGMA journal_mode=WAL;
+                "PRAGMA journal_mode=DELETE;
                  PRAGMA synchronous=NORMAL;
                  PRAGMA cache_size=-64000;",
             ).ok();
+            // Verificar que el journal mode es DELETE
+            if let Ok(mode) = conn.query_row::<String, _, _>(
+                "PRAGMA journal_mode", [], |r| r.get(0),
+            ) {
+                log::debug!("Writer journal_mode: {}", mode);
+            }
 
             for result in rx {
                 let FileResult {
@@ -294,25 +360,34 @@ pub fn build_graph(
                 if let Some((_, old_id)) = existing.iter().find_map(|(p, v)| {
                     if *p == relative_str { Some(v) } else { None }
                 }) {
-                    let _ = tx.execute(
+                    if let Err(e) = tx.execute(
                         "DELETE FROM edges WHERE (target_id = ?1 AND type = 'mentioned_in') OR (source_id = ?1 AND type IN ('tagged_with', 'belongs_to', 'co_occurs_with', 'mentioned_in'))",
                         rusqlite::params![old_id],
-                    );
-                    let _ = tx.execute(
+                    ) {
+                        log::warn!("⚠️  Error limpiando edges viejos para {}: {}", relative_str, e);
+                    }
+                    if let Err(e) = tx.execute(
                         "DELETE FROM edges WHERE target_id = ?1 OR source_id = ?1",
                         rusqlite::params![old_id],
-                    );
+                    ) {
+                        log::warn!("⚠️  Error limpiando edges viejos (2) para {}: {}", relative_str, e);
+                    }
                 }
 
-                // Insertar/actualizar nodo nota (sin embedding — usamos chunks)
+                // Insertar/actualizar nodo nota por `key` (identidad = ruta)
                 if let Err(e) = tx.execute(
-                    "INSERT INTO nodes (label, type, metadata, embedding)
-                     VALUES (?1, 'note', ?2, ?3)
-                     ON CONFLICT(label) DO UPDATE SET
-                       type = excluded.type,
+                    "INSERT INTO nodes (key, label, type, metadata, embedding)
+                     VALUES (?1, ?2, 'note', ?3, ?4)
+                     ON CONFLICT(key) DO UPDATE SET
+                       label = excluded.label,
                        metadata = excluded.metadata,
                        embedding = excluded.embedding",
-                    rusqlite::params![note_title, note_metadata, None::<&[u8]>],
+                    rusqlite::params![
+                        note_key(&relative_str),
+                        note_title,
+                        note_metadata,
+                        None::<&[u8]>
+                    ],
                 ) {
                     log::warn!("⚠️  Error insertando nodo nota '{}': {}", note_title, e);
                     pb.lock().unwrap().inc(1);
@@ -321,8 +396,8 @@ pub fn build_graph(
 
                 // Obtener ID de la nota
                 let note_node_id: i64 = match tx.query_row(
-                    "SELECT id FROM nodes WHERE label = ?1",
-                    rusqlite::params![note_title],
+                    "SELECT id FROM nodes WHERE key = ?1",
+                    rusqlite::params![note_key(&relative_str)],
                     |row| row.get(0),
                 ) {
                     Ok(id) => id,
@@ -357,25 +432,29 @@ pub fn build_graph(
                             "source": ner_model,
                         });
 
-                        let _ = tx.execute(
-                            "INSERT INTO nodes (label, type, metadata, embedding)
-                             VALUES (?1, ?2, ?3, ?4)
-                             ON CONFLICT(label) DO UPDATE SET
+                        if let Err(e) = tx.execute(
+                            "INSERT INTO nodes (key, label, type, metadata, embedding)
+                             VALUES (?1, ?2, ?3, ?4, ?5)
+                             ON CONFLICT(key) DO UPDATE SET
                                metadata = excluded.metadata,
                                embedding = excluded.embedding",
-                            rusqlite::params![ent.label, ent.type_, ent_metadata.to_string(), None::<&[u8]>],
-                        );
+                            rusqlite::params![node_key(&ent.label), ent.label, ent.type_, ent_metadata.to_string(), None::<&[u8]>],
+                        ) {
+                            log::warn!("⚠️  Error insertando entidad '{}': {}", ent.label, e);
+                        }
 
                         if let Ok(ent_node_id) = tx.query_row::<i64, _, _>(
-                            "SELECT id FROM nodes WHERE label = ?1",
-                            rusqlite::params![ent.label],
+                            "SELECT id FROM nodes WHERE key = ?1",
+                            rusqlite::params![node_key(&ent.label)],
                             |row| row.get(0),
                         ) {
-                            let _ = tx.execute(
+                            if let Err(e) = tx.execute(
                                 "INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context)
                                  VALUES (?1, ?2, 'mentioned_in', ?3, ?4)",
                                 rusqlite::params![ent_node_id, note_node_id, ent.score, chunk_ref],
-                            );
+                            ) {
+                                log::warn!("⚠️  Error insertando edge mentioned_in: {}", e);
+                            }
                         }
                     }
 
@@ -386,16 +465,18 @@ pub fn build_graph(
                             let weight = entities[i].score.min(entities[j].score);
 
                             if let (Ok(src_id), Ok(dst_id)) = (
-                                tx.query_row::<i64, _, _>("SELECT id FROM nodes WHERE label = ?1",
-                                    rusqlite::params![entities[i].label], |row| row.get(0)),
-                                tx.query_row::<i64, _, _>("SELECT id FROM nodes WHERE label = ?1",
-                                    rusqlite::params![entities[j].label], |row| row.get(0)),
+                                tx.query_row::<i64, _, _>("SELECT id FROM nodes WHERE key = ?1",
+                                    rusqlite::params![node_key(&entities[i].label)], |row| row.get(0)),
+                                tx.query_row::<i64, _, _>("SELECT id FROM nodes WHERE key = ?1",
+                                    rusqlite::params![node_key(&entities[j].label)], |row| row.get(0)),
                             ) {
-                                let _ = tx.execute(
+                                if let Err(e) = tx.execute(
                                     "INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context)
                                      VALUES (?1, ?2, 'co_occurs_with', ?3, ?4)",
                                     rusqlite::params![src_id, dst_id, weight, chunk_ref],
-                                );
+                                ) {
+                                    log::warn!("⚠️  Error insertando edge co_occurs_with: {}", e);
+                                }
                             }
                         }
                     }
@@ -403,56 +484,72 @@ pub fn build_graph(
 
                 // Relaciones estructurales: directorio
                 if !parent_dir.is_empty() && !skip_dirs.contains(&parent_dir.as_str()) {
-                    let _ = tx.execute(
-                        "INSERT INTO nodes (label, type, embedding) VALUES (?1, 'tag', ?2) ON CONFLICT(label) DO UPDATE SET embedding = excluded.embedding",
-                        rusqlite::params![parent_dir, None::<&[u8]>],
-                    );
+                    if let Err(e) = tx.execute(
+                        "INSERT INTO nodes (key, label, type, embedding) VALUES (?1, ?2, 'tag', ?3) ON CONFLICT(key) DO UPDATE SET embedding = excluded.embedding",
+                        rusqlite::params![node_key(&parent_dir), parent_dir, None::<&[u8]>],
+                    ) {
+                        log::warn!("⚠️  Error insertando tag directorio '{}': {}", parent_dir, e);
+                    }
                     if let Ok(dir_id) = tx.query_row::<i64, _, _>(
-                        "SELECT id FROM nodes WHERE label = ?1",
-                        rusqlite::params![parent_dir],
+                        "SELECT id FROM nodes WHERE key = ?1",
+                        rusqlite::params![node_key(&parent_dir)],
                         |row| row.get(0),
                     ) {
-                        let _ = tx.execute(
+                        if let Err(e) = tx.execute(
                             "INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context)
                              VALUES (?1, ?2, 'belongs_to', 1.0, ?3)",
                             rusqlite::params![note_node_id, dir_id, relative_str],
-                        );
+                        ) {
+                            log::warn!("⚠️  Error insertando edge belongs_to: {}", e);
+                        }
                     }
                 }
 
                 // Relaciones estructurales: tags
                 for tag in &tags {
-                    let _ = tx.execute(
-                        "INSERT INTO nodes (label, type, embedding) VALUES (?1, 'tag', ?2) ON CONFLICT(label) DO UPDATE SET embedding = excluded.embedding",
-                        rusqlite::params![tag, None::<&[u8]>],
-                    );
+                    if let Err(e) = tx.execute(
+                        "INSERT INTO nodes (key, label, type, embedding) VALUES (?1, ?2, 'tag', ?3) ON CONFLICT(key) DO UPDATE SET embedding = excluded.embedding",
+                        rusqlite::params![node_key(tag), tag, None::<&[u8]>],
+                    ) {
+                        log::warn!("⚠️  Error insertando tag '{}': {}", tag, e);
+                    }
                     if let Ok(tag_id) = tx.query_row::<i64, _, _>(
-                        "SELECT id FROM nodes WHERE label = ?1",
-                        rusqlite::params![tag],
+                        "SELECT id FROM nodes WHERE key = ?1",
+                        rusqlite::params![node_key(tag)],
                         |row| row.get(0),
                     ) {
-                        let _ = tx.execute(
+                        if let Err(e) = tx.execute(
                             "INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context)
                              VALUES (?1, ?2, 'tagged_with', 1.0, ?3)",
                             rusqlite::params![note_node_id, tag_id, relative_str],
-                        );
+                        ) {
+                            log::warn!("⚠️  Error insertando edge tagged_with: {}", e);
+                        }
                     }
                 }
 
                 // Insertar chunks embedidos en la tabla `chunks`
                 for cd in chunk_data {
-                    let _ = crate::db::chunks::insert_chunk(
+                    if let Err(e) = crate::db::chunks::insert_chunk(
                         &tx, note_node_id, &cd.header, &cd.text, &cd.slug,
                         Some(&cd.embedding_blob), None,
-                    );
+                    ) {
+                        log::warn!("⚠️  Error insertando chunk '{}': {}", cd.header, e);
+                    }
                 }
 
                 // Commit de la transacción del archivo
+                log::info!("  ▶ Guardando '{}' en BD...", relative_str);
                 if let Err(e) = tx.commit() {
                     log::error!("Error haciendo commit writer para {}: {}", relative_str, e);
                     pb.lock().unwrap().inc(1);
                     continue;
                 }
+                log::info!("  ✓ Guardado '{}' en BD", relative_str);
+                // Checkpoint TRUNCATE en la MISMA conexión del writer:
+                // garantiza que los datos se escriban al DB principal
+                // antes de que el writer entregue el control.
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 
                 // Actualizar estadísticas compartidas
                 {
@@ -462,6 +559,13 @@ pub fn build_graph(
                 }
 
                 pb.lock().unwrap().inc(1);
+
+                // Verificar SIGINT después de commit
+                if interrupted.load(Ordering::SeqCst) {
+                    info!("Build interrumpido. Cortando...");
+                    break;
+                }
+
                 let msg = format!("{} ({} chunks, {} entidades)", relative_str, chunk_data.len(), all_entity_count);
                 pb.lock().unwrap().set_message(msg);
                 debug!("  Commit OK. Nota '{}' procesada.", note_title);
@@ -474,6 +578,10 @@ pub fn build_graph(
             let tx = tx.clone();
             s.spawn(move || {
                 for md_path in chunk {
+                    // Verificar interrupción antes de procesar cada archivo
+                    if interrupted.load(Ordering::SeqCst) {
+                        break;
+                    }
                     let relative = md_path.strip_prefix(repo).unwrap_or(md_path);
                     let relative_str = relative.display().to_string();
 
@@ -571,6 +679,11 @@ pub fn build_graph(
                         }
                     };
 
+                    // Verificar interrupción después de NER
+                    if interrupted.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     // Tags del frontmatter
                     let tags: Vec<String> = metadata
                         .get("tags")
@@ -634,6 +747,11 @@ pub fn build_graph(
                         }
                     };
 
+                    // Verificar interrupción después de embeddings
+                    if interrupted.load(Ordering::SeqCst) {
+                        break;
+                    }
+
                     // Enviar al writer
                     let result = FileResult {
                         relative_str: relative_str.to_string(),
@@ -658,6 +776,30 @@ pub fn build_graph(
 
     // ── Recolectar stats de los hilos ─────────────────────────────────────
     let thread_stats = stats_lock.lock().unwrap().clone();
+
+    // ── Verificar interrupción por SIGINT ─────────────────────────────────
+    if interrupted.load(Ordering::SeqCst) {
+        pb.lock()
+            .unwrap()
+            .finish_with_message("⚠️ Build interrumpido por el usuario");
+        eprintln!(
+            "⚠️  Build interrumpido. {} archivos procesados. Continuando cierre limpio...",
+            thread_stats.files
+        );
+        // NO llamamos a process::exit(130) aquí, dejamos que el conexión
+        // se cierre limpiamente.
+        // El writer ya hizo TRUNCATE checkpoint antes de romper el loop,
+        // los datos están en el DB principal.
+        let mut stats = thread_stats;
+        // Consultar estadísticas reales de la BD antes de salir
+        stats.total_nodes = conn
+            .query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))
+            .unwrap_or(0);
+        stats.total_edges = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap_or(0);
+        return Ok(stats);
+    }
 
     // ── Limpiar notas eliminadas del disco ────────────────────────────────
     let prune_spinner = ProgressBar::new_spinner();
@@ -704,30 +846,13 @@ pub fn build_graph(
 
     let pruned = ids_to_prune.len();
     if pruned > 0 {
-        for (id, label) in &ids_to_prune {
-            conn.execute(
-                "DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1",
-                rusqlite::params![id],
-            )
-            .with_context(|| format!("Error deleting edges for pruned note id={}", id))?;
-            conn.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
-                .with_context(|| format!("Error deleting node id={} label={}", id, label))?;
-            info!("Nota eliminada (archivo no encontrado): {}", label);
-        }
-        info!("Notas eliminadas del grafo: {}", pruned);
-        debug!(
-            "Limpieza completada: {} notas eliminadas del disco.",
-            pruned
-        );
+        prune_stale_notes(&conn, &ids_to_prune)?;
     }
     prune_spinner.finish_with_message(format!("✅ {} notas eliminadas del disco", pruned));
 
     // ── Limpiar entidades huérfanas ──────────────────────────────────────
-    // Nodos de tipo 'entity' o 'tag' sin ninguna arista → se eliminan
-    conn.execute_batch(
-        "DELETE FROM nodes WHERE type IN ('entity', 'tag', 'language', 'tool', 'database', 'library', 'framework', 'concept', 'security', 'os')
-         AND id NOT IN (SELECT source_id FROM edges UNION SELECT target_id FROM edges);"
-    ).ok();
+    // Nodos que no son notas y no tienen ninguna arista → se eliminan.
+    delete_orphan_entities(&conn)?;
 
     pb.lock().unwrap().finish_with_message("✅ ¡Completado!");
 
@@ -761,9 +886,65 @@ pub fn build_graph(
     Ok(stats)
 }
 
+/// Delete every entity-like node that is not referenced by any edge.
+///
+/// The `type NOT IN ('note', 'root', 'system')` predicate covers the remaining
+/// entity-like node types (entity, tag, language, tool, …) without a hardcoded,
+/// easily-diverging allow-list, while preserving the bootstrap nodes
+/// (`_root`, `_graphrag_core`, `_unresolved`) that carry the `root`/`system`
+/// types and may legitimately have no edges. Errors are propagated to the caller.
+pub fn delete_orphan_entities(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    conn.execute(
+        "DELETE FROM nodes WHERE type NOT IN ('note', 'root', 'system')
+         AND id NOT IN (SELECT source_id FROM edges UNION SELECT target_id FROM edges);",
+        [],
+    )
+    .context("Error deleting orphan entity nodes")?;
+    Ok(())
+}
+
+/// Delete stale notes (whose files no longer exist on disk) and their associated data.
+/// Returns the number of pruned notes.
+pub fn prune_stale_notes(
+    conn: &rusqlite::Connection,
+    ids_to_prune: &[(i64, String)],
+) -> anyhow::Result<usize> {
+    let pruned = ids_to_prune.len();
+    if pruned > 0 {
+        for (id, label) in ids_to_prune {
+            conn.execute(
+                "DELETE FROM edges WHERE source_id = ?1 OR target_id = ?1",
+                rusqlite::params![id],
+            )
+            .with_context(|| format!("Error deleting edges for pruned note id={}", id))?;
+
+            // Delete chunks referencing this note before deleting the node
+            // to avoid FOREIGN KEY constraint failure.
+            conn.execute(
+                "DELETE FROM chunks WHERE note_id = ?1",
+                rusqlite::params![id],
+            )
+            .with_context(|| format!("Error deleting chunks for pruned note id={}", id))?;
+
+            conn.execute("DELETE FROM nodes WHERE id = ?1", rusqlite::params![id])
+                .with_context(|| format!("Error deleting node id={} label={}", id, label))?;
+
+            info!("Nota eliminada (archivo no encontrado): {}", label);
+        }
+        info!("Notas eliminadas del grafo: {}", pruned);
+        debug!(
+            "Limpieza completada: {} notas eliminadas del disco.",
+            pruned
+        );
+    }
+
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json;
     use std::fs;
     use tempfile::NamedTempFile;
 
@@ -867,6 +1048,163 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_stale_notes_fk_failure() {
+        // Set up in-memory DB with schema (includes PRAGMA foreign_keys=ON)
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        // Insert a note node
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'note', ?4)",
+            rusqlite::params![
+                100,
+                crate::db::keys::note_key("test-note"),
+                "test-note",
+                r#"{"path":"not/exists.md","slug":"test-note"}"#
+            ],
+        )
+        .unwrap();
+
+        // Insert 2 chunk rows referencing note_id=100
+        conn.execute(
+            "INSERT INTO chunks (note_id, header, text, slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![100, "Intro", "Test content one", "intro"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (note_id, header, text, slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![100, "Details", "Test content two", "details"],
+        )
+        .unwrap();
+
+        // Insert an edge referencing node_id=100
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, type, weight) VALUES (?1, ?2, 'test', 1.0)",
+            rusqlite::params![100, 100],
+        )
+        .unwrap();
+
+        // Call prune_stale_notes — should SUCCEED now because the fix deletes chunks first
+        let result = prune_stale_notes(&conn, &[(100, "test-note".into())]);
+        assert!(
+            result.is_ok(),
+            "GREEN: Expected success after fix — with DELETE FROM chunks before node deletion, \
+             the FK constraint should not be violated. Got error: {:?}",
+            result
+        );
+
+        // Verify the note node, its chunks, and its edges are all gone
+        let note_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 100", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(note_count, 0, "note node should be deleted");
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks WHERE note_id = 100", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(chunk_count, 0, "chunks should be deleted");
+
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE source_id = 100 OR target_id = 100",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_count, 0, "edges should be deleted");
+    }
+
+    #[test]
+    fn test_delete_orphan_entities_removes_orphan_keeps_connected() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        // A note acting as the anchor of the connected entity.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'note', '{}')",
+            rusqlite::params![200, crate::db::keys::note_key("anchor"), "anchor"],
+        )
+        .unwrap();
+
+        // Entity with NO edges → must be pruned.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'language', '{}')",
+            rusqlite::params![201, "ent-orphan", "Orphan"],
+        )
+        .unwrap();
+
+        // Bootstrap `system` node with NO edges → must be preserved.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'system', '{}')",
+            rusqlite::params![203, "_graphrag_core", "_graphrag_core"],
+        )
+        .unwrap();
+
+        // Bootstrap `root` node with NO edges → must be preserved.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'root', '{}')",
+            rusqlite::params![204, "_root", "_root"],
+        )
+        .unwrap();
+
+        // Entity WITH an edge → must survive.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'tool', '{}')",
+            rusqlite::params![202, "ent-kept", "Kept"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, type, weight) VALUES (?1, ?2, 'mentioned_in', 1.0)",
+            rusqlite::params![202, 200],
+        )
+        .unwrap();
+
+        delete_orphan_entities(&conn).expect("orphan cleanup should succeed");
+
+        let orphan: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 201", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(orphan, 0, "orphan entity (no edges) should be deleted");
+
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 202", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1, "entity with edges should remain");
+
+        let note: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 200", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(note, 1, "note nodes must never be pruned here");
+
+        let system: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 203", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            system, 1,
+            "orphan `system` bootstrap node must be preserved"
+        );
+
+        let root: i64 = conn
+            .query_row("SELECT COUNT(*) FROM nodes WHERE id = 204", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(root, 1, "orphan `root` bootstrap node must be preserved");
+    }
+
+    #[test]
     fn test_build_stats_display() {
         let stats = BuildStats {
             files: 10,
@@ -880,5 +1218,332 @@ mod tests {
         assert!(output.contains("100"));
         assert!(output.contains("250"));
         assert!(output.contains("Archivos procesados"));
+    }
+
+    // ── Tests for collect_existing_hashes ──────────────────────────────
+
+    #[test]
+    fn test_collect_existing_hashes_includes_matching() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        // Insert a note node with hash + path in metadata
+        conn.execute(
+            "INSERT INTO nodes (key, label, type, metadata) VALUES (?1, ?2, 'note', ?3)",
+            rusqlite::params![
+                crate::db::keys::note_key("test-note"),
+                "test-note",
+                r#"{"path": "docs/guide.md", "hash": "abc123def456", "content": "hello"}"#
+            ],
+        )
+        .unwrap();
+
+        let result = collect_existing_hashes(&conn).unwrap();
+
+        assert_eq!(result.len(), 1, "should contain exactly one entry");
+        let (hash, _id) = result
+            .get("docs/guide.md")
+            .expect("should contain key 'docs/guide.md'");
+        assert_eq!(hash, "abc123def456", "hash should match");
+    }
+
+    #[test]
+    fn test_collect_existing_hashes_excludes_legacy() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        // Insert a note node with metadata lacking hash and path (legacy format)
+        conn.execute(
+            "INSERT INTO nodes (key, label, type, metadata) VALUES (?1, ?2, 'note', ?3)",
+            rusqlite::params![
+                crate::db::keys::note_key("legacy-note"),
+                "legacy-note",
+                r#"{"slug": "foo", "content": "bar"}"#
+            ],
+        )
+        .unwrap();
+
+        let result = collect_existing_hashes(&conn).unwrap();
+
+        assert!(
+            result.is_empty(),
+            "legacy note without hash/path should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_wal_checkpoint_preserves_committed_data() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Connection 1: writer with WAL mode
+        let conn1 = Connection::open(db_str)?;
+        conn1.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        crate::db::schema::init_db(&conn1)?;
+
+        // Insert a note in a transaction and commit
+        conn1.execute(
+            "INSERT INTO nodes (key, label, type, metadata) VALUES ('node:test-note', 'test-note', 'note', '{\"hash\":\"abc\",\"path\":\"test.md\"}')",
+            [],
+        )?;
+
+        // Simulate WAL checkpoint (as SIGINT handler would do)
+        conn1.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        drop(conn1);
+
+        // Reopen and verify the data survives
+        let conn2 = Connection::open(db_str)?;
+        let count: i64 = conn2.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE label = 'test-note'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 1, "Data should survive WAL checkpoint + reopen");
+        Ok(())
+    }
+
+    #[test]
+    fn test_incremental_build_roundtrip() -> anyhow::Result<()> {
+        // Create a temp directory with 3 .md files
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap().to_string();
+        let repo_path = dir.path().join("notes");
+        std::fs::create_dir_all(&repo_path)?;
+
+        // Write 3 .md files
+        let note1_path = repo_path.join("alpha.md");
+        std::fs::write(
+            &note1_path,
+            "---\ntitle: Alpha\n---\n# Alpha\n\nContent about Python.\n",
+        )?;
+
+        let note2_path = repo_path.join("beta.md");
+        std::fs::write(
+            &note2_path,
+            "---\ntitle: Beta\n---\n# Beta\n\nContent about Rust.\n",
+        )?;
+
+        let note3_path = repo_path.join("gamma.md");
+        std::fs::write(
+            &note3_path,
+            "---\ntitle: Gamma\n---\n# Gamma\n\nContent about Go.\n",
+        )?;
+
+        // Compute hashes for all 3 files
+        let compute_hash = |path: &std::path::Path| -> String {
+            let text = std::fs::read_to_string(path).unwrap();
+            let mut hasher = Sha256::new();
+            hasher.update(text.as_bytes());
+            let result = hasher.finalize();
+            result
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        };
+
+        let hash1 = compute_hash(&note1_path);
+        let hash2 = compute_hash(&note2_path);
+        let hash3 = compute_hash(&note3_path);
+
+        // Step 1: Insert notes into DB as if they were already processed
+        // (simulating the state after a first successful build)
+        let conn = Connection::open(&db_str)?;
+        schema::init_db(&conn)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+
+        let rel1 = "alpha.md";
+        let rel2 = "beta.md";
+        let rel3 = "gamma.md";
+
+        conn.execute(
+            "INSERT INTO nodes (key, label, type, metadata) VALUES ('node:Alpha', 'Alpha', 'note', ?1)",
+            rusqlite::params![serde_json::json!({
+                "path": rel1,
+                "hash": hash1,
+                "slug": "alpha",
+                "content": "# Alpha\n\nContent about Python."
+            })
+            .to_string()],
+        )?;
+        conn.execute(
+            "INSERT INTO nodes (key, label, type, metadata) VALUES ('node:Beta', 'Beta', 'note', ?1)",
+            rusqlite::params![serde_json::json!({
+                "path": rel2,
+                "hash": hash2,
+                "slug": "beta",
+                "content": "# Beta\n\nContent about Rust."
+            })
+            .to_string()],
+        )?;
+        conn.execute(
+            "INSERT INTO nodes (key, label, type, metadata) VALUES ('node:Gamma', 'Gamma', 'note', ?1)",
+            rusqlite::params![serde_json::json!({
+                "path": rel3,
+                "hash": hash3,
+                "slug": "gamma",
+                "content": "# Gamma\n\nContent about Go."
+            })
+            .to_string()],
+        )?;
+
+        drop(conn);
+
+        // Step 2: Verify collect_existing_hashes finds all 3 notes
+        {
+            let conn = Connection::open(&db_str)?;
+            let existing = collect_existing_hashes(&conn)?;
+            assert_eq!(existing.len(), 3, "Should find all 3 notes with hash/path");
+            assert!(existing.contains_key("alpha.md"));
+            assert!(existing.contains_key("beta.md"));
+            assert!(existing.contains_key("gamma.md"));
+        }
+
+        // Step 3: Verify hashes match (files unchanged)
+        {
+            let conn = Connection::open(&db_str)?;
+            let existing = collect_existing_hashes(&conn)?;
+            assert_eq!(existing.len(), 3, "Should still find 3 notes");
+
+            assert_eq!(
+                existing.get("alpha.md").unwrap().0,
+                compute_hash(&note1_path),
+                "Hash for alpha should match"
+            );
+            assert_eq!(
+                existing.get("beta.md").unwrap().0,
+                compute_hash(&note2_path),
+                "Hash for beta should match"
+            );
+            assert_eq!(
+                existing.get("gamma.md").unwrap().0,
+                compute_hash(&note3_path),
+                "Hash for gamma should match"
+            );
+        }
+
+        // Step 4: Modify one file
+        std::fs::write(
+            &note1_path,
+            "---\ntitle: Alpha\n---\n# Alpha\n\nModified content about Python and Rust.\n",
+        )?;
+        let new_hash1 = compute_hash(&note1_path);
+        assert_ne!(
+            new_hash1, hash1,
+            "Hash should be different after modification"
+        );
+
+        // Step 5: After modification, stored hash should differ from new file hash
+        {
+            let conn = Connection::open(&db_str)?;
+            let existing = collect_existing_hashes(&conn)?;
+            assert_eq!(existing.len(), 3, "Should still find 3 notes in DB");
+
+            let (stored_hash, _) = existing.get("alpha.md").unwrap();
+            assert_ne!(
+                *stored_hash, new_hash1,
+                "Stored hash should differ from new file hash"
+            );
+            // Stored hash should still equal the ORIGINAL hash
+            assert_eq!(
+                *stored_hash, hash1,
+                "Stored hash should equal original hash"
+            );
+        }
+
+        Ok(())
+    }
+
+    // ── node-identity by key (RED) ─────────────────────────────────────
+
+    /// Simulate two note upserts sharing a label but with distinct keys.
+    /// They must produce two nodes (no collision on title).
+    #[test]
+    fn test_upsert_note_by_key_distinct_titles() {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_db(&conn).unwrap();
+
+        let upsert = |key: &str, label: &str| {
+            conn.execute(
+                "INSERT INTO nodes (key, label, type, metadata, embedding)
+                 VALUES (?1, ?2, 'note', '{}', NULL)
+                 ON CONFLICT(key) DO UPDATE SET
+                   label = excluded.label,
+                   metadata = excluded.metadata,
+                   embedding = excluded.embedding",
+                rusqlite::params![key, label],
+            )
+            .unwrap();
+        };
+
+        upsert("note:a/dup.md", "Duplicado");
+        upsert("note:b/dup.md", "Duplicado");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE label = 'Duplicado' AND type = 'note'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "distinct keys must yield two note nodes");
+    }
+
+    /// End-to-end convergence: two files with the same title.
+    /// Requires a running Ollama server.
+    #[test]
+    #[ignore = "needs Ollama"]
+    fn test_build_duplicate_titles_converges() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join("a"))?;
+        fs::create_dir_all(repo.join("b"))?;
+        fs::write(
+            repo.join("a/dup.md"),
+            "---\ntitle: Duplicado\n---\n# A\n\nContenido uno sobre Python y Docker.\n",
+        )?;
+        fs::write(
+            repo.join("b/dup.md"),
+            "---\ntitle: Duplicado\n---\n# B\n\nContenido dos sobre Rust y SQLite.\n",
+        )?;
+
+        let db_path = dir.path().join("test.db");
+        let db_str = db_path.to_str().unwrap();
+        let repo_str = repo.to_str().unwrap();
+
+        let stats1 = build_graph(
+            repo_str,
+            db_str,
+            "http://localhost:11434",
+            "llama3.2:3b",
+            "nomic-embed-text",
+            2,
+        )?;
+        assert_eq!(stats1.files, 2, "first build must process 2 files");
+
+        {
+            let conn = Connection::open(db_str)?;
+            let notes: i64 =
+                conn.query_row("SELECT COUNT(*) FROM nodes WHERE type = 'note'", [], |r| {
+                    r.get(0)
+                })?;
+            assert_eq!(notes, 2, "two distinct note nodes must exist");
+        }
+
+        let stats2 = build_graph(
+            repo_str,
+            db_str,
+            "http://localhost:11434",
+            "llama3.2:3b",
+            "nomic-embed-text",
+            2,
+        )?;
+        assert_eq!(
+            stats2.files, 0,
+            "second build must report 0 files to process"
+        );
+
+        Ok(())
     }
 }

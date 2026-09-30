@@ -378,9 +378,14 @@ mod tests {
 
     /// Insert an entity node.
     fn insert_node(conn: &Connection, id: i64, label: &str, type_: &str) {
+        let key = if type_ == "note" {
+            crate::db::keys::note_key(label)
+        } else {
+            crate::db::keys::node_key(label)
+        };
         conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, '{}')",
-            rusqlite::params![id, label, type_],
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, ?4, '{}')",
+            rusqlite::params![id, key, label, type_],
         )
         .unwrap();
     }

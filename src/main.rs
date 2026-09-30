@@ -139,6 +139,48 @@ enum Commands {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+    /// Responde una pregunta en lenguaje natural (RAG: retrieval híbrido + generación con Ollama)
+    Ask {
+        /// Pregunta en lenguaje natural
+        #[arg(allow_hyphen_values = true)]
+        query: String,
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
+        /// Número de resultados de retrieval
+        #[arg(short, long, default_value = "5")]
+        k: usize,
+        /// Profundidad de expansión en el grafo
+        #[arg(short, long, default_value = "2")]
+        depth: i32,
+        /// Peso de la componente vectorial (0.0-1.0)
+        #[arg(short, long, default_value = "0.7")]
+        alpha: f64,
+        /// URL de Ollama
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        /// Modelo de embeddings
+        #[arg(long, default_value = "nomic-embed-text")]
+        embed_model: String,
+        /// Peso mínimo de arista para expansión
+        #[arg(long)]
+        min_weight: Option<f64>,
+        /// Solo notas (sin entidades ni tags)
+        #[arg(long)]
+        notes_only: bool,
+        /// Filtrar por campo de metadatos (repeatable). Formato: 'campo operador valor'
+        #[arg(long = "filter", value_name = "EXPR")]
+        filter: Vec<String>,
+        /// Número máximo de resúmenes de comunidad en el contexto (default: 3)
+        #[arg(long, default_value = "3")]
+        communities: usize,
+        /// Modelo de Ollama para generación (por defecto: summary_model de la config)
+        #[arg(long)]
+        model: Option<String>,
+        /// Formato de salida: table, list, json
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
     /// Búsqueda solo por grafo desde un nodo
     Graph {
         /// Etiqueta del nodo de partida
@@ -374,6 +416,7 @@ fn main() -> Result<()> {
             } else {
                 &embed_model
             };
+            let summary_model = cfg.summary_model.clone();
             debug!(
                 "Comando: search query='{}', k={}, depth={}",
                 query, k, depth
@@ -386,10 +429,62 @@ fn main() -> Result<()> {
                 alpha_val,
                 ollama_url,
                 embed_model,
+                &summary_model,
                 min_weight,
                 notes_only,
                 &filter,
                 answer,
+                &format,
+            )
+        }
+        Commands::Ask {
+            query,
+            db,
+            k,
+            depth,
+            alpha,
+            ollama_url,
+            embed_model,
+            min_weight,
+            notes_only,
+            filter,
+            communities,
+            model,
+            format,
+        } => {
+            let db = if db == "graphrag.db" { &cfg.db } else { &db };
+            let k = if k == 5 { cfg.k } else { k };
+            let depth = if depth == 2 { cfg.depth } else { depth };
+            let alpha_val = if (alpha - 0.7).abs() < 0.01 {
+                cfg.alpha
+            } else {
+                alpha
+            };
+            let ollama_url = if ollama_url == "http://localhost:11434" {
+                &cfg.ollama_url
+            } else {
+                &ollama_url
+            };
+            let embed_model = if embed_model == "nomic-embed-text" {
+                &cfg.embed_model
+            } else {
+                &embed_model
+            };
+            let summary_model = model.unwrap_or_else(|| cfg.summary_model.clone());
+            debug!("Comando: ask query='{}', k={}, depth={}", query, k, depth);
+            cmd_ask(
+                &query,
+                db,
+                k,
+                depth,
+                alpha_val,
+                ollama_url,
+                embed_model,
+                min_weight,
+                notes_only,
+                &filter,
+                communities,
+                &summary_model,
                 &format,
             )
         }
@@ -764,6 +859,9 @@ fn cmd_build(
     Ok(())
 }
 
+/// Run a hybrid search. When `answer` is true, additionally generate a narrative
+/// RAG answer using `summary_model` (the configured generation model) as the
+/// Ollama generator; `embed_model` is used only for query embeddings.
 #[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: &str,
@@ -773,6 +871,7 @@ fn cmd_search(
     alpha: f64,
     ollama_url: &str,
     embed_model: &str,
+    summary_model: &str,
     min_weight: Option<f64>,
     notes_only: bool,
     filter: &[String],
@@ -859,10 +958,12 @@ fn cmd_search(
             query,
             &results,
             &community_embeddings,
-            embed_model,
+            summary_model,
+            &crate::community::search::AnswerOptions::default(),
         ) {
-            Ok(answer_text) => {
-                println!("{}", answer_text);
+            Ok(answer) => {
+                println!("{}", answer.answer);
+                print_sources(&answer.sources);
             }
             Err(e) => {
                 eprintln!("❌ Error generando respuesta: {}", e);
@@ -871,6 +972,165 @@ fn cmd_search(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_ask(
+    query: &str,
+    db: &str,
+    k: usize,
+    depth: i32,
+    alpha: f64,
+    ollama_url: &str,
+    embed_model: &str,
+    min_weight: Option<f64>,
+    notes_only: bool,
+    filter: &[String],
+    communities: usize,
+    summary_model: &str,
+    format: &OutputFormat,
+) -> Result<()> {
+    // Parse filters (fail early on invalid syntax)
+    let filters: Vec<search::filter::Filter> = filter
+        .iter()
+        .map(|f| search::filter::parse_filter(f))
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|e| {
+            eprintln!("❌ {}", e);
+            e
+        })?;
+
+    let ollama = embed::ollama::OllamaClient::new(ollama_url, embed_model);
+    let mut hs = search::HybridSearch::new(db, ollama.clone())?;
+
+    if !matches!(format, OutputFormat::Json) {
+        println!("\n❓ Pregunta: '{}'", query);
+        println!("   k={}, depth={}, alpha={}", k, depth, alpha);
+        if let Some(mw) = min_weight {
+            println!("   min_weight={}", mw);
+        }
+        if notes_only {
+            println!("   solo notas");
+        }
+        if !filters.is_empty() {
+            println!("   filtros:");
+            for f in &filters {
+                println!("     {} {} {}", f.field, f.operator, f.value);
+            }
+        }
+        println!();
+    }
+
+    // ---- Retrieval (same flags as `search`) ----
+    // Retrieval needs Ollama to embed the query; if it is unreachable we
+    // degrade gracefully instead of failing the command.
+    let results = match hs.hybrid_search(query, k, depth, alpha, min_weight, notes_only, &filters) {
+        Ok(r) => r,
+        Err(e) => {
+            if ollama.health_check().is_err() {
+                eprintln!("⚠️  Ollama no disponible: no se pudo recuperar contexto.");
+                eprintln!("⚠️  answer generation skipped; is Ollama running?");
+                if matches!(format, OutputFormat::Json) {
+                    println!(
+                        "{}",
+                        build_ask_json("answer generation skipped; is Ollama running?", &[])
+                    );
+                } else {
+                    println!("\n🧠 RESULTADOS DE RETRIEVAL\n{}", "─".repeat(50));
+                    display_results(&[], format);
+                }
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
+
+    // ---- Load communities (graceful when none exist) ----
+    let conn = rusqlite::Connection::open(db)?;
+    let community_embeddings =
+        crate::db::communities::load_all_community_embeddings(&conn).unwrap_or_default();
+
+    if community_embeddings.is_empty() && !matches!(format, OutputFormat::Json) {
+        eprintln!(
+            "⚠️  No hay comunidades con resumen. Ejecuta 'graphrag community detect' \
+             (y 'graphrag community summarize') para enriquecer las respuestas."
+        );
+    }
+
+    let opts = crate::community::search::AnswerOptions {
+        communities,
+        evidence: k,
+        ..crate::community::search::AnswerOptions::default()
+    };
+
+    // ---- Generation with graceful degradation ----
+    let generated = if ollama.health_check().is_err() {
+        None
+    } else {
+        crate::community::search::answer_query(
+            &ollama,
+            query,
+            &results,
+            &community_embeddings,
+            summary_model,
+            &opts,
+        )
+        .ok()
+    };
+
+    match generated {
+        Some(answer) => match format {
+            OutputFormat::Json => {
+                println!("{}", build_ask_json(&answer.answer, &results));
+            }
+            OutputFormat::Table | OutputFormat::List => {
+                println!("\n💡 Respuesta:\n{}", "─".repeat(50));
+                println!("{}", answer.answer);
+                print_sources(&answer.sources);
+            }
+        },
+        None => {
+            // Ollama unavailable (or generation failed): degrade to retrieval only.
+            if matches!(format, OutputFormat::Json) {
+                println!(
+                    "{}",
+                    build_ask_json("answer generation skipped; is Ollama running?", &results)
+                );
+            } else {
+                println!("\n🧠 RESULTADOS DE RETRIEVAL\n{}", "─".repeat(50));
+                display_results(&results, format);
+            }
+            eprintln!("⚠️  answer generation skipped; is Ollama running?");
+        }
+    }
+
+    Ok(())
+}
+
+/// Assemble the `--format json` payload for `ask`: `{ answer, sources, results }`
+/// with `sources` deduplicated via [`crate::community::search::AnswerResult::sources_from_results`].
+fn build_ask_json(answer: &str, results: &[crate::search::SearchResult]) -> String {
+    let sources = crate::community::search::AnswerResult::sources_from_results(results);
+    let value = serde_json::json!({
+        "answer": answer,
+        "sources": sources,
+        "results": results,
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Print a deduplicated "Sources" section (label + optional path).
+fn print_sources(sources: &[crate::community::search::Source]) {
+    if sources.is_empty() {
+        return;
+    }
+    println!("\n📚 Sources:");
+    for s in sources {
+        match &s.path {
+            Some(p) => println!("   - {} ({})", s.label, p),
+            None => println!("   - {}", s.label),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1222,5 +1482,182 @@ mod tests {
         let results: Vec<SearchResult> = vec![];
         display_results(&results, &OutputFormat::Json);
         // Should print "[]" without panic
+    }
+
+    // ==================================================================
+    // RED — add-ask-rag-command (rag-ask delta)
+    //
+    // Targets the NEW public surface in this binary and therefore does
+    // not compile until the GREEN phase lands:
+    //   * `Commands::Ask { query, db, k, depth, alpha, min_weight,
+    //                      notes_only, filter, communities, model, format, .. }`
+    //   * `build_ask_json(answer, results) -> String`
+    // ==================================================================
+
+    // ------------------------------------------------------------------
+    // RED-4 — `ask` argument parsing (clap)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_ask_args_parse_all_flags() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "ask",
+            "como configuro nginx",
+            "test.db",
+            "-k",
+            "7",
+            "-d",
+            "0",
+            "-a",
+            "0.5",
+            "--filter",
+            "date >= 2024",
+            "--communities",
+            "2",
+            "--model",
+            "gpt-oss:latest",
+            "--format",
+            "json",
+        ])
+        .expect("`ask` with all supported flags should parse");
+
+        match cli.command {
+            Commands::Ask {
+                query,
+                db,
+                k,
+                depth,
+                alpha,
+                filter,
+                communities,
+                model,
+                format,
+                ..
+            } => {
+                assert_eq!(query, "como configuro nginx");
+                assert_eq!(db, "test.db");
+                assert_eq!(k, 7);
+                assert_eq!(depth, 0);
+                assert!((alpha - 0.5).abs() < 1e-9, "alpha must round-trip");
+                assert_eq!(filter, vec!["date >= 2024".to_string()]);
+                assert_eq!(communities, 2);
+                assert_eq!(model.as_deref(), Some("gpt-oss:latest"));
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected Commands::Ask"),
+        }
+    }
+
+    #[test]
+    fn test_ask_requires_query() {
+        let result = Cli::try_parse_from(["graphrag", "ask"]);
+        assert!(
+            result.is_err(),
+            "`ask` without a query must be a clap parsing error"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // RED-5 — JSON output assembly (pure function, dedup sources)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ask_json_dedups_sources() {
+        let results = vec![
+            SearchResult {
+                id: 1,
+                label: "nginx".into(),
+                r#type: "note".into(),
+                score: 0.9,
+                content: "c1".into(),
+                file: "/notes/nginx.md".into(),
+                neighbors: vec![],
+                chunk_header: "Setup".into(),
+                chunk_text: "server { listen 80; }".into(),
+            },
+            SearchResult {
+                id: 2,
+                label: "nginx".into(),
+                r#type: "note".into(),
+                score: 0.8,
+                content: "c2".into(),
+                file: "/notes/nginx.md".into(),
+                neighbors: vec![],
+                chunk_header: "TLS".into(),
+                chunk_text: "ssl_certificate /etc/ssl/cert.pem;".into(),
+            },
+            SearchResult {
+                id: 3,
+                label: "docker".into(),
+                r#type: "note".into(),
+                score: 0.7,
+                content: "c3".into(),
+                file: "/notes/docker.md".into(),
+                neighbors: vec![],
+                chunk_header: "Intro".into(),
+                chunk_text: "Docker runs containers.".into(),
+            },
+        ];
+
+        let json = build_ask_json("respuesta generada", &results);
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("ask JSON output must be valid JSON");
+
+        assert_eq!(value["answer"], "respuesta generada");
+        assert!(value["results"].is_array(), "must expose the results array");
+
+        let sources = value["sources"]
+            .as_array()
+            .expect("sources must be an array");
+        assert_eq!(
+            sources.len(),
+            2,
+            "'nginx' must appear once despite two chunks"
+        );
+        assert!(
+            sources
+                .iter()
+                .all(|s| s.get("label").is_some() && s.get("path").is_some()),
+            "each source must expose label and path"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Regression — `search --answer` must use the generation model
+    // (`summary_model`), not the embedding model. Requires Ollama.
+    // Run with `cargo test -- --ignored test_cmd_search_answer_end_to_end`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "needs Ollama running"]
+    fn test_cmd_search_answer_end_to_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("demo.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        crate::seed::demo_data::create_demo_db(&db, "http://localhost:11434", "bge-m3:latest")
+            .expect("seed demo db");
+
+        let res = cmd_search(
+            "nginx",
+            &db,
+            3,
+            2,
+            0.7,
+            "http://localhost:11434",
+            "bge-m3:latest",
+            "llama3.2:3b",
+            None,
+            false,
+            &[],
+            true,
+            &OutputFormat::List,
+        );
+
+        assert!(
+            res.is_ok(),
+            "cmd_search --answer must succeed (generation model = summary_model): {res:?}"
+        );
     }
 }

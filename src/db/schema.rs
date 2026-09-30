@@ -62,7 +62,8 @@ pub const SCHEMA_MAIN: &str = r#"
 -- Tabla de nodos: notas, entidades, etiquetas
 CREATE TABLE IF NOT EXISTS nodes (
     id          INTEGER PRIMARY KEY,
-    label       TEXT    NOT NULL UNIQUE,
+    key         TEXT    NOT NULL,
+    label       TEXT    NOT NULL,
     type        TEXT    NOT NULL,
     embedding   BLOB,
     metadata    TEXT,
@@ -85,6 +86,7 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type   ON edges(type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_key  ON nodes(key);
 CREATE INDEX IF NOT EXISTS idx_nodes_type   ON nodes(type);
 
 -- Índice FTS5 para búsqueda textual (tabla independiente)
@@ -152,10 +154,10 @@ pub const SCHEMA_SEED: &str = {
     // directly, so we use a raw string literal that repeats the schema.)
     const SEED_INSERTS: &str = r#"
 -- Seed data: bootstrap nodes
-INSERT OR IGNORE INTO nodes (id, label, type, metadata) VALUES
-    (1, '_root',          'root',   '{"description":"Root anchor for singleton sub-graphs"}'),
-    (2, '_graphrag_core', 'system', '{"description":"GraphRAG kernel marker"}'),
-    (3, '_unresolved',    'system', '{"description":"Dangling reference sink"}');
+INSERT OR IGNORE INTO nodes (id, key, label, type, metadata) VALUES
+    (1, 'node:_root',          '_root',          'root',   '{"description":"Root anchor for singleton sub-graphs"}'),
+    (2, 'node:_graphrag_core', '_graphrag_core', 'system', '{"description":"GraphRAG kernel marker"}'),
+    (3, 'node:_unresolved',    '_unresolved',    'system', '{"description":"Dangling reference sink"}');
 
 -- Seed data: bootstrap edges
 INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context) VALUES
@@ -172,7 +174,8 @@ INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context) VALUES
 -- Tabla de nodos: notas, entidades, etiquetas
 CREATE TABLE IF NOT EXISTS nodes (
     id          INTEGER PRIMARY KEY,
-    label       TEXT    NOT NULL UNIQUE,
+    key         TEXT    NOT NULL,
+    label       TEXT    NOT NULL,
     type        TEXT    NOT NULL,
     embedding   BLOB,
     metadata    TEXT,
@@ -195,6 +198,7 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type   ON edges(type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_key  ON nodes(key);
 CREATE INDEX IF NOT EXISTS idx_nodes_type   ON nodes(type);
 
 -- Índice FTS5 para búsqueda textual (tabla independiente)
@@ -235,10 +239,10 @@ CREATE INDEX IF NOT EXISTS idx_communities_level ON communities(level);
 CREATE INDEX IF NOT EXISTS idx_communities_parent ON communities(parent_id);
 
 -- Seed data: bootstrap nodes
-INSERT OR IGNORE INTO nodes (id, label, type, metadata) VALUES
-    (1, '_root',          'root',   '{"description":"Root anchor for singleton sub-graphs"}'),
-    (2, '_graphrag_core', 'system', '{"description":"GraphRAG kernel marker"}'),
-    (3, '_unresolved',    'system', '{"description":"Dangling reference sink"}');
+INSERT OR IGNORE INTO nodes (id, key, label, type, metadata) VALUES
+    (1, 'node:_root',          '_root',          'root',   '{"description":"Root anchor for singleton sub-graphs"}'),
+    (2, 'node:_graphrag_core', '_graphrag_core', 'system', '{"description":"GraphRAG kernel marker"}'),
+    (3, 'node:_unresolved',    '_unresolved',    'system', '{"description":"Dangling reference sink"}');
 
 -- Seed data: bootstrap edges
 INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context) VALUES
@@ -282,15 +286,110 @@ INSERT OR IGNORE INTO edges (source_id, target_id, type, weight, context) VALUES
 /// let conn = Connection::open("graph.db")?;
 /// init_db(&conn)?;
 /// ```
+/// Returns `true` if `table` has a column named `column`.
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn init_db(conn: &rusqlite::Connection) -> anyhow::Result<()> {
-    conn.execute_batch("PRAGMA journal_mode=WAL")
-        .context("failed to enable WAL journal mode")?;
+    conn.execute_batch("PRAGMA journal_mode=DELETE")
+        .context("failed to set DELETE journal mode")?;
 
     conn.execute_batch("PRAGMA foreign_keys=ON")
         .context("failed to enable foreign key enforcement")?;
 
+    // ── Schema migration v1 -> v2 ──────────────────────────────────────
+    // The identity column `key` was introduced in v2.  A legacy database
+    // (no `key` column, `UNIQUE(label)`) is rebuilt exactly once, gated by
+    // `PRAGMA user_version`.  Node `id`s and the FKs from `edges`/`chunks`
+    // are preserved.
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let nodes_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nodes'",
+        [],
+        |r| r.get(0),
+    )?;
+
+    if nodes_exists > 0 && user_version < 2 && !column_exists(conn, "nodes", "key")? {
+        // FK enforcement must be OFF and legacy rename semantics used so
+        // that renaming `nodes` -> `nodes_old` does NOT rewrite the FK
+        // clauses of `edges`/`chunks` (which must keep referencing `nodes`).
+        conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;")
+            .context("failed to prepare legacy table rebuild")?;
+
+        {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "ALTER TABLE nodes RENAME TO nodes_old;
+                 CREATE TABLE nodes (
+                     id          INTEGER PRIMARY KEY,
+                     key         TEXT    NOT NULL,
+                     label       TEXT    NOT NULL,
+                     type        TEXT    NOT NULL,
+                     embedding   BLOB,
+                     metadata    TEXT,
+                     created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO nodes (id, key, label, type, embedding, metadata, created_at)
+                   SELECT id,
+                     CASE WHEN type = 'note'
+                          THEN 'note:' || COALESCE(
+                                 json_extract(
+                                   CASE WHEN json_valid(metadata) THEN metadata ELSE NULL END,
+                                   '$.path'
+                                 ),
+                                 'legacy:' || id
+                               )
+                          ELSE 'node:' || label
+                     END,
+                     label, type, embedding, metadata, created_at
+                   FROM nodes_old;",
+            )
+            .context("failed to rebuild nodes for schema v2")?;
+
+            // Comprobación de integridad: la reconstrucción no debe perder
+            // ni duplicar filas.  Si los recuentos no cuadran, abortamos y
+            // la transacción hace rollback (la tabla original queda intacta).
+            let old_count: i64 =
+                tx.query_row("SELECT COUNT(*) FROM nodes_old", [], |r| r.get(0))?;
+            let new_count: i64 = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+            anyhow::ensure!(
+                old_count == new_count,
+                "schema v2 migration integrity check failed: \
+                 nodes_old={old_count}, nodes={new_count}"
+            );
+
+            // El bump de versión va DENTRO de la misma transacción que el
+            // DROP, de modo que la migración y el cambio de versión son
+            // atómicos: o se aplican ambos, o ninguno.
+            tx.execute_batch("DROP TABLE nodes_old; PRAGMA user_version=2;")
+                .context("failed to finalize schema v2 migration")?;
+            tx.commit()
+                .context("failed to commit schema v2 migration")?;
+        }
+
+        conn.execute_batch("PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;")
+            .context("failed to restore legacy table/foreign-key pragmas")?;
+    }
+
     conn.execute_batch(SCHEMA_MAIN)
         .context("failed to execute main schema DDL")?;
+
+    // Las bases de datos migradas ya fijaron `user_version=2` de forma
+    // atómica dentro de su transacción.  Este bloque cubre el caso de una
+    // base nueva (sin tabla `nodes` previa), que no pasa por la migración.
+    if user_version < 2 {
+        conn.execute_batch("PRAGMA user_version=2")
+            .context("failed to set schema user_version to 2")?;
+    }
 
     Ok(())
 }
@@ -339,8 +438,9 @@ mod tests {
 
         // Insert a node with a JSON metadata blob containing `content`.
         conn.execute(
-            "INSERT INTO nodes (label, type, metadata) VALUES (?1, ?2, ?3)",
+            "INSERT INTO nodes (key, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
+                crate::db::keys::note_key("test-note"),
                 "test-note",
                 "note",
                 r#"{"content":"hello world from GraphRAG"}"#,
@@ -402,12 +502,12 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        // Verify WAL mode is set.
+        // Verify DELETE mode is set.
         let journal: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert!(
-            journal.to_uppercase() == "WAL" || journal.to_uppercase() == "MEMORY",
+            journal.to_uppercase() == "DELETE" || journal.to_uppercase() == "MEMORY",
             "unexpected journal mode: {}",
             journal
         );
@@ -444,8 +544,13 @@ mod tests {
 
         // Insert a parent node for the FK reference.
         conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![1i64, "test-note", "note", r#"{"content":"test"}"#],
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'note', ?4)",
+            rusqlite::params![
+                1i64,
+                crate::db::keys::note_key("test-note"),
+                "test-note",
+                r#"{"content":"test"}"#
+            ],
         )
         .unwrap();
 
@@ -462,5 +567,206 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    // ── node-identity v2 tests (RED) ──────────────────────────────────
+
+    /// DDL of the legacy (v1) schema, before the `key` column existed.
+    const LEGACY_SCHEMA: &str = r#"
+CREATE TABLE nodes (
+    id          INTEGER PRIMARY KEY,
+    label       TEXT    NOT NULL UNIQUE,
+    type        TEXT    NOT NULL,
+    embedding   BLOB,
+    metadata    TEXT,
+    created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE edges (
+    id          INTEGER PRIMARY KEY,
+    source_id   INTEGER NOT NULL,
+    target_id   INTEGER NOT NULL,
+    type        TEXT    NOT NULL,
+    weight      REAL    DEFAULT 1.0,
+    context     TEXT,
+    FOREIGN KEY (source_id) REFERENCES nodes(id),
+    FOREIGN KEY (target_id) REFERENCES nodes(id)
+);
+CREATE TABLE chunks (
+    id          INTEGER PRIMARY KEY,
+    note_id     INTEGER NOT NULL REFERENCES nodes(id),
+    header      TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    embedding   BLOB,
+    metadata    TEXT
+);
+"#;
+
+    /// Two nodes may share a label as long as their keys differ.
+    #[test]
+    fn test_duplicate_labels_allowed() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (key, label, type) VALUES ('note:a/dup.md', 'Duplicado', 'note')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (key, label, type) VALUES ('note:b/dup.md', 'Duplicado', 'note')",
+            [],
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE label = 'Duplicado'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "two nodes with the same label must coexist");
+    }
+
+    /// Duplicate keys must be rejected by the unique index.
+    #[test]
+    fn test_key_unique_enforced() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO nodes (key, label, type) VALUES ('note:a/dup.md', 'A', 'note')",
+            [],
+        )
+        .unwrap();
+
+        let err = conn.execute(
+            "INSERT INTO nodes (key, label, type) VALUES ('note:a/dup.md', 'B', 'note')",
+            [],
+        );
+        assert!(err.is_err(), "duplicate key must violate uniqueness");
+    }
+
+    /// A legacy database is migrated to v2, preserving ids/FKs.
+    #[test]
+    fn test_migrate_v1_to_v2() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
+
+        conn.execute(
+            r#"INSERT INTO nodes (id, label, type, metadata) VALUES (1, 'Foo', 'note', '{"path":"a/foo.md"}')"#,
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type, metadata) VALUES (2, 'Python', 'language', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, label, type) VALUES (3, 'Other', 'note')",
+            [],
+        )
+        .unwrap();
+        // Edge + chunk referencing node ids, to prove FKs survive the rebuild.
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, type, weight) VALUES (2, 1, 'mentioned_in', 1.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (note_id, header, text, slug) VALUES (1, 'H', 'body text', 'h')",
+            [],
+        )
+        .unwrap();
+
+        // Default user_version is 0 (legacy).
+        let before: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 0);
+
+        init_db(&conn).unwrap();
+
+        let k1: String = conn
+            .query_row("SELECT key FROM nodes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(k1, "note:a/foo.md", "note backfilled from metadata.path");
+
+        let k2: String = conn
+            .query_row("SELECT key FROM nodes WHERE id = 2", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(k2, "node:Python", "non-note backfilled from label");
+
+        let k3: String = conn
+            .query_row("SELECT key FROM nodes WHERE id = 3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(k3, "note:legacy:3", "note without path uses legacy key");
+
+        // ids and labels preserved.
+        let label1: String = conn
+            .query_row("SELECT label FROM nodes WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label1, "Foo");
+
+        // FKs survive: the edge still resolves to the migrated nodes.
+        let edge_ok: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges e JOIN nodes s ON e.source_id = s.id JOIN nodes t ON e.target_id = t.id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_ok, 1, "edge FKs must survive migration");
+        let chunk_ok: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks c JOIN nodes n ON c.note_id = n.id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chunk_ok, 1, "chunk FKs must survive migration");
+
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_nodes_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "idx_nodes_key must exist");
+
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 2, "user_version must be 2 after migration");
+    }
+
+    /// Running `init_db` twice must not re-key or fail.
+    #[test]
+    fn test_migrate_idempotent() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO nodes (key, label, type) VALUES ('note:a/foo.md', 'Foo', 'note')",
+            [],
+        )
+        .unwrap();
+
+        // Second run on an already-v2 database.
+        init_db(&conn).unwrap();
+
+        let key: String = conn
+            .query_row("SELECT key FROM nodes WHERE label = 'Foo'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(key, "note:a/foo.md", "key must be unchanged");
+
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 2);
     }
 }

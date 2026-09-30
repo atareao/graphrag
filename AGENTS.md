@@ -151,6 +151,7 @@ cargo build --release
 | `seed <db>` | Populate demo data (44 nodes, ~113 edges) |
 | `build <repo> <db>` | Scan `.md` dir, extract entities via Ollama NER, build graph. Default repo: `.` |
 | `search <query> <db>` | Hybrid search (vectors + graph expansion) |
+| `ask <query> <db>` | RAG: hybrid retrieval + communities → Ollama answer with cited sources |
 | `fts <query> <db>` | FTS5 exact-text search |
 | `graph <label> <db>` | Show neighbors of a node |
 | `path <from> <to> <db>` | Shortest path between two nodes |
@@ -166,10 +167,10 @@ cargo build --release
 | `-k` | search | 5 | Number of results |
 | `-d` | search, graph | 2 | Graph expansion depth |
 | `-a` | search | 0.7 | Vector weight (0.0=pure graph, 1.0=pure vector) |
-| `--vector-only` | search | false | Skip graph expansion entirely |
 | `--notes-only` | search | false | Show only notes (no entities/tags) |
 | `--min-weight` | search | none | Filter edges by minimum weight |
-| `--ollama` | search | false | Use Ollama for embeddings (default: synthetic) |
+| `--communities` | ask | 3 | Max community summaries in RAG context |
+| `--model` | ask | config summary_model | Ollama model for answer generation |
 | `--ollama-url` | build, search, mcp | `http://localhost:11434` | |
 | `--ner-model` | build | `llama3.2:3b` | Model for entity extraction |
 | `--embed-model` | build, search, mcp | `nomic-embed-text` | Model for embeddings |
@@ -183,6 +184,7 @@ src/
 ├── main.rs              ← CLI entrypoint (clap, 11 subcommands)
 ├── config.rs            ← TOML config (XDG: ~/.config/graphrag/config.toml, auto-created)
 ├── db/schema.rs         ← SQLite schema + FTS5 (no triggers)
+├── db/keys.rs           ← Identidad de nodos: note:<ruta> / node:<label>
 ├── graph/
 │   ├── build.rs         ← Incremental build (SHA256 hash-based, parallel NER + serial writer)
 │   └── expand.rs        ← CTE recursive expansion + shortest path
@@ -226,7 +228,11 @@ Configuración TOML con auto-creación en `$XDG_CONFIG_HOME/graphrag/config.toml
 
 #### `src/db/schema.rs` (361 lines)
 
-Esquema SQLite: tabla `nodes` (id, label, type, embedding BLOB, metadata JSON, created_at), tabla `edges` (source_id, target_id, type, weight, context) con FK, índices, y FTS5 virtual table `notes_fts`. Sin triggers — FTS se repuebla desde Rust. 4 tests.
+Esquema SQLite v2: tabla `nodes` (id, `key` TEXT UNIQUE, label, type, embedding BLOB, metadata JSON, created_at), tabla `edges` (source_id, target_id, type, weight, context) con FK, índices (incluido el único `idx_nodes_key`), y FTS5 virtual table `notes_fts`. Sin triggers — FTS se repuebla desde Rust. La identidad es `note:<ruta relativa>` para notas y `node:<label>` para el resto; `label` no es único. Migración v1→v2 idempotente vía `PRAGMA user_version`. 4 tests.
+
+#### `src/db/keys.rs`
+
+Helpers de identidad de nodos: `note_key(ruta)` → `note:<ruta relativa>` y `node_key(label)` → `node:<label>`. Centralizan la construcción de `key` usada en upserts, lookups y migración.
 
 #### `src/graph/build.rs` (829 lines)
 

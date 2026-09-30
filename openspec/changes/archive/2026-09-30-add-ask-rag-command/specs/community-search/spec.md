@@ -1,25 +1,10 @@
 # community-search Specification
 
 ## Purpose
-Integrates community summaries into search: normal search displays relevant communities alongside chunk results; `--answer` mode uses community summaries as high-level RAG context plus chunk evidence for LLM-generated narrative answers.
 
-## Requirements
+Delta: make the RAG generator (`answer_query`) configurable and return structured sources, so it can back the new `graphrag ask` command as well as `search --answer`.
 
-### Requirement: Normal search shows relevant communities
-After computing chunk-level results and graph expansion, `search` SHALL compute the top-2 most similar communities by cosine similarity against `communities.summary_embedding`. These SHALL be displayed below the main results with community label and summary preview.
-
-#### Scenario: Search displays community context
-- **GIVEN** a database with populated communities and their summaries
-- **WHEN** user runs `graphrag search "Python web frameworks" test.db`
-- **THEN** the output SHALL include the main results (notes + chunks)
-- **AND** a "Related communities" section showing top-2 matching communities
-- **AND** each community SHALL show its label and first 120 characters of the summary
-
-#### Scenario: No communities exist
-- **GIVEN** a database where `community detect` has not been run
-- **WHEN** user runs `graphrag search "query" test.db`
-- **THEN** the output SHALL NOT include a "Related communities" section
-- **AND** no error SHALL be shown
+## MODIFIED Requirements
 
 ### Requirement: Answer mode (`--answer`) uses community summaries as RAG context
 
@@ -57,13 +42,6 @@ The generator SHALL be exposed as a reusable function that accepts generation op
 - **WHEN** the user runs `graphrag search --answer "asdasdasdasd" test.db`
 - **THEN** the command SHALL display: "No relevant information found for your query."
 
-#### Scenario: Answer mode uses the configured generation model
-
-- **GIVEN** a config with `summary_model = "llama3.2:3b"` and `embed_model = "bge-m3"`
-- **WHEN** the user runs `graphrag search --answer "query" test.db`
-- **THEN** answer generation SHALL use `summary_model`, not the embedding model
-- **AND** the command SHALL produce a non-empty narrative answer
-
 ### Requirement: Answer mode respects context window limits
 
 To avoid exceeding the LLM context window, the generator SHALL default to:
@@ -85,11 +63,3 @@ These counts and limits SHALL be configurable through the generator options; the
 - **GIVEN** a caller passing `communities = 1` and `evidence = 3`
 - **WHEN** the generator builds the prompt
 - **THEN** at most 1 community and 3 chunks SHALL be included
-
-### Requirement: CLI integration
-`graphrag search --answer <query> <db>` SHALL be a valid command. The `--answer` flag SHALL be a boolean flag (no value). Existing flags (`-k`, `-d`, `-a`, `--filter`, `--notes-only`, `--min-weight`) SHALL still work when combined with `--answer`.
-
-#### Scenario: Answer mode with filters
-- **WHEN** user runs `graphrag search --answer "web frameworks" test.db --filter 'date >= 2023'`
-- **THEN** only chunks from notes matching the filter SHALL be used as evidence
-- **AND** only communities whose entities appear in those notes SHALL be considered
