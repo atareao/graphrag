@@ -123,8 +123,13 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![1i64, "test-note", "note", r#"{"content":"test"}"#],
+            "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'note', ?4)",
+            rusqlite::params![
+                1i64,
+                crate::db::keys::note_key("test-note"),
+                "test-note",
+                r#"{"content":"test"}"#
+            ],
         )
         .unwrap();
         conn

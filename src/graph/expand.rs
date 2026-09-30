@@ -153,9 +153,14 @@ pub fn shortest_path(
     let mut stmt = conn.prepare_cached(
         r#"
         WITH RECURSIVE path(from_id, to_id, route, depth, visited) AS (
-            SELECT n.id, n.id, n.label, 0, ',' || CAST(n.id AS TEXT) || ','
-            FROM nodes n
-            WHERE n.label = ?1
+            SELECT id, id, label, 0, ',' || CAST(id AS TEXT) || ','
+            FROM (
+                SELECT n.id AS id, n.label AS label
+                FROM nodes n
+                WHERE n.label = ?1 OR n.key = ?1
+                ORDER BY (n.key = ?1) DESC, n.id ASC
+                LIMIT 1
+            )
 
             UNION ALL
 
@@ -177,7 +182,8 @@ pub fn shortest_path(
         )
         SELECT route, depth
         FROM path
-        WHERE to_id = (SELECT id FROM nodes WHERE label = ?2)
+        WHERE to_id = (SELECT id FROM nodes WHERE label = ?2 OR key = ?2
+                       ORDER BY (key = ?2) DESC, id ASC LIMIT 1)
         ORDER BY depth
         LIMIT 1
         "#,
@@ -221,10 +227,10 @@ mod tests {
 
         // Insert test nodes
         conn.execute_batch(
-            "INSERT INTO nodes (id, label, type) VALUES (1, 'Python', 'language');
-             INSERT INTO nodes (id, label, type) VALUES (2, 'PostgreSQL', 'database');
-             INSERT INTO nodes (id, label, type) VALUES (3, 'SQLAlchemy', 'library');
-             INSERT INTO nodes (id, label, type) VALUES (4, 'Docker', 'tool');
+            "INSERT INTO nodes (id, key, label, type) VALUES (1, 'node:Python', 'Python', 'language');
+             INSERT INTO nodes (id, key, label, type) VALUES (2, 'node:PostgreSQL', 'PostgreSQL', 'database');
+             INSERT INTO nodes (id, key, label, type) VALUES (3, 'node:SQLAlchemy', 'SQLAlchemy', 'library');
+             INSERT INTO nodes (id, key, label, type) VALUES (4, 'node:Docker', 'Docker', 'tool');
              INSERT INTO edges (source_id, target_id, type, weight) VALUES (1, 3, 'uses', 0.9);
              INSERT INTO edges (source_id, target_id, type, weight) VALUES (3, 2, 'connects', 0.8);
              INSERT INTO edges (source_id, target_id, type, weight) VALUES (1, 4, 'runs_in', 0.7);
