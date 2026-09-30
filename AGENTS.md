@@ -183,6 +183,7 @@ src/
 ├── main.rs              ← CLI entrypoint (clap, 11 subcommands)
 ├── config.rs            ← TOML config (XDG: ~/.config/graphrag/config.toml, auto-created)
 ├── db/schema.rs         ← SQLite schema + FTS5 (no triggers)
+├── db/keys.rs           ← Identidad de nodos: note:<ruta> / node:<label>
 ├── graph/
 │   ├── build.rs         ← Incremental build (SHA256 hash-based, parallel NER + serial writer)
 │   └── expand.rs        ← CTE recursive expansion + shortest path
@@ -226,7 +227,11 @@ Configuración TOML con auto-creación en `$XDG_CONFIG_HOME/graphrag/config.toml
 
 #### `src/db/schema.rs` (361 lines)
 
-Esquema SQLite: tabla `nodes` (id, label, type, embedding BLOB, metadata JSON, created_at), tabla `edges` (source_id, target_id, type, weight, context) con FK, índices, y FTS5 virtual table `notes_fts`. Sin triggers — FTS se repuebla desde Rust. 4 tests.
+Esquema SQLite v2: tabla `nodes` (id, `key` TEXT UNIQUE, label, type, embedding BLOB, metadata JSON, created_at), tabla `edges` (source_id, target_id, type, weight, context) con FK, índices (incluido el único `idx_nodes_key`), y FTS5 virtual table `notes_fts`. Sin triggers — FTS se repuebla desde Rust. La identidad es `note:<ruta relativa>` para notas y `node:<label>` para el resto; `label` no es único. Migración v1→v2 idempotente vía `PRAGMA user_version`. 4 tests.
+
+#### `src/db/keys.rs`
+
+Helpers de identidad de nodos: `note_key(ruta)` → `note:<ruta relativa>` y `node_key(label)` → `node:<label>`. Centralizan la construcción de `key` usada en upserts, lookups y migración.
 
 #### `src/graph/build.rs` (829 lines)
 
