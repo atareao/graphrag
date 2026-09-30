@@ -1,5 +1,36 @@
 # Changelog
+## [0.2.7] - 2026-09-30
+
+### Bug Fixes
+
+- *(build)* Identificar notas por ruta (key) y migrar esquema a v2
+- *(search)* Usar summary_model en --answer, no el modelo de embeddings
+
+### Documentation
+
+- *(openspec)* Archivar change fix-note-identity-by-path
+- Documentar la identidad de nodos por key
+- *(openspec)* Proponer change add-ask-rag-command
+- *(openspec)* Archivar change add-ask-rag-command
+- Documentar `graphrag ask` (README EN/ES, AGENTS.md)
+
+### Features
+
+- *(ask)* Comando RAG `graphrag ask`
+
+### Miscellaneous Tasks
+
+- Sincronizar Cargo.lock con Cargo.toml (0.2.3 -> 0.2.5)
+
+### Testing
+
+- *(map)* Layout determinista con seed fijo
 ## [0.2.6] - 2026-09-26
+
+### Miscellaneous Tasks
+
+- Release v0.2.6
+## [0.4.0] - 2026-09-26
 
 ### Other
 
