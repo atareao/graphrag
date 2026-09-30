@@ -1396,7 +1396,8 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
 │      nodes       │       │        edges          │
 ├──────────────────┤       ├───────────────────────┤
 │ id        INT PK │──┐    │ source_id INT FK      │
-│ label     TEXT   │  └────┤ target_id INT FK      │
+│ key       TEXT UQ│  └────┤ target_id INT FK      │
+│ label     TEXT   │  ┌────┤ type       TEXT        │
 │ type      TEXT   │  ┌────┤ type       TEXT        │
 │ embedding BLOB  │  │    │ weight     REAL        │
 │ metadata  JSON  │  │    │ context    TEXT        │
@@ -1411,6 +1412,8 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
                       └────┤                       │
                            └───────────────────────┘
 ```
+
+**Identidad de nodos:** cada nodo tiene una `key` única. Las notas usan `key = "note:" + <ruta relativa>`; las entidades, tags y directorios usan `key = "node:" + <label>`. Así dos notas con el mismo título —o una nota cuyo título coincide con una entidad— se guardan como nodos independientes en lugar de sobrescribirse, y el build incremental converge.
 
 ---
 

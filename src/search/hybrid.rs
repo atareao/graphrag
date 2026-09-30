@@ -515,7 +515,8 @@ impl HybridSearch {
         let id: i64 = self
             .conn
             .query_row(
-                "SELECT id FROM nodes WHERE label = ?1",
+                "SELECT id FROM nodes WHERE key = ?1 OR label = ?1 \
+                 ORDER BY (key = ?1) DESC, id ASC LIMIT 1",
                 rusqlite::params![node_label],
                 |row| row.get(0),
             )
@@ -540,7 +541,8 @@ impl HybridSearch {
         let note_id: i64 = self
             .conn
             .query_row(
-                "SELECT id FROM nodes WHERE label = ?1",
+                "SELECT id FROM nodes WHERE key = ?1 OR label = ?1 \
+                 ORDER BY (key = ?1) DESC, id ASC LIMIT 1",
                 rusqlite::params![label],
                 |row| row.get(0),
             )
@@ -989,17 +991,31 @@ mod tests {
     use crate::search::filter::Filter;
     use crate::vector::vector_to_blob;
 
+    /// Inserta una nota usando el helper real de claves (`note:<path>`).
+    fn insert_note(conn: &rusqlite::Connection, id: i64, name: &str, metadata: Option<&str>) {
+        match metadata {
+            Some(meta) => conn
+                .execute(
+                    "INSERT INTO nodes (id, key, label, type, metadata) VALUES (?1, ?2, ?3, 'note', ?4)",
+                    rusqlite::params![id, crate::db::keys::note_key(name), name, meta],
+                )
+                .unwrap(),
+            None => conn
+                .execute(
+                    "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, ?3, 'note')",
+                    rusqlite::params![id, crate::db::keys::note_key(name), name],
+                )
+                .unwrap(),
+        };
+    }
+
     /// Creates an in-memory database with a note and some chunks with embeddings.
     fn setup_db_with_chunks() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
         // Insert a note node with metadata
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![1i64, "test-note", "note", r#"{"path":"/tmp/test.md"}"#],
-        )
-        .unwrap();
+        insert_note(&conn, 1, "test-note", Some(r#"{"path":"/tmp/test.md"}"#));
 
         // Insert two chunks with embeddings
         let emb1 = vector_to_blob(&[0.1_f32, 0.2_f32, 0.3_f32]);
@@ -1091,8 +1107,8 @@ mod tests {
         init_db(&conn).unwrap();
 
         conn.execute(
-            "INSERT INTO nodes (id, label, type) VALUES (?1, ?2, ?3)",
-            rusqlite::params![42i64, "My Note", "note"],
+            "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, ?3, 'note')",
+            rusqlite::params![42i64, crate::db::keys::note_key("My Note"), "My Note"],
         )
         .unwrap();
 
@@ -1152,16 +1168,12 @@ mod tests {
     fn test_get_note_label_with_filters_matching() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                42i64,
-                "My Note",
-                "note",
-                r#"{"date": 2023, "category": "tutorial"}"#
-            ],
-        )
-        .unwrap();
+        insert_note(
+            &conn,
+            42,
+            "My Note",
+            Some(r#"{"date": 2023, "category": "tutorial"}"#),
+        );
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1179,16 +1191,12 @@ mod tests {
     fn test_get_note_label_with_filters_non_matching() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                42i64,
-                "My Note",
-                "note",
-                r#"{"date": 2021, "category": "guide"}"#
-            ],
-        )
-        .unwrap();
+        insert_note(
+            &conn,
+            42,
+            "My Note",
+            Some(r#"{"date": 2021, "category": "guide"}"#),
+        );
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1206,11 +1214,7 @@ mod tests {
     fn test_get_note_label_with_filters_no_filters() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![42i64, "My Note", "note", r#"{"date": 2023}"#],
-        )
-        .unwrap();
+        insert_note(&conn, 42, "My Note", Some(r#"{"date": 2023}"#));
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1224,11 +1228,7 @@ mod tests {
     fn test_get_note_label_with_filters_non_existent_field() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![42i64, "My Note", "note", r#"{"date": 2023}"#],
-        )
-        .unwrap();
+        insert_note(&conn, 42, "My Note", Some(r#"{"date": 2023}"#));
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1247,16 +1247,12 @@ mod tests {
     fn test_get_note_label_with_filters_multiple_and() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                42i64,
-                "Tutorial Note",
-                "note",
-                r#"{"date": 2023, "category": "tutorial", "status": "published"}"#
-            ],
-        )
-        .unwrap();
+        insert_note(
+            &conn,
+            42,
+            "Tutorial Note",
+            Some(r#"{"date": 2023, "category": "tutorial", "status": "published"}"#),
+        );
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1282,16 +1278,12 @@ mod tests {
     fn test_get_note_label_with_filters_multiple_and_one_fails() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                42i64,
-                "Old Guide",
-                "note",
-                r#"{"date": 2021, "category": "guide", "status": "archived"}"#
-            ],
-        )
-        .unwrap();
+        insert_note(
+            &conn,
+            42,
+            "Old Guide",
+            Some(r#"{"date": 2021, "category": "guide", "status": "archived"}"#),
+        );
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1338,11 +1330,7 @@ mod tests {
         init_db(&conn).unwrap();
 
         // Insert a note node (so FTS expansion doesn't crash) but NO chunks.
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![1i64, "test-note", "note", r#"{"path":"/tmp/test.md"}"#],
-        )
-        .unwrap();
+        insert_note(&conn, 1, "test-note", Some(r#"{"path":"/tmp/test.md"}"#));
 
         let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
         let mut hs = HybridSearch::new_internal(conn, ollama).unwrap();
@@ -1384,11 +1372,12 @@ mod tests {
         let conn = setup_db_with_chunks();
 
         // Añadir una segunda nota con chunks para que haya algo con qué comparar
-        conn.execute(
-            "INSERT INTO nodes (id, label, type, metadata) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![2i64, "second-note", "note", r#"{"path":"/tmp/second.md"}"#],
-        )
-        .unwrap();
+        insert_note(
+            &conn,
+            2,
+            "second-note",
+            Some(r#"{"path":"/tmp/second.md"}"#),
+        );
 
         // Chunk con embedding similar al chunk 1 de test-note (más cercano a [0.1,0.2,0.3])
         let emb_similar = crate::vector::vector_to_blob(&[0.11_f32, 0.21_f32, 0.31_f32]);
@@ -1449,6 +1438,55 @@ mod tests {
             err.contains("no encontrado") || err.contains("NotFound"),
             "error should mention file not found: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_graph_only_resolution_is_deterministic_prefers_key() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Dos notas con el MISMO `label` ("Dup") pero distinta `key`.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, 'Dup', 'note')",
+            rusqlite::params![1i64, crate::db::keys::note_key("a/dup.md")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, 'Dup', 'note')",
+            rusqlite::params![2i64, crate::db::keys::note_key("b/dup.md")],
+        )
+        .unwrap();
+
+        // Entidad enlazada SOLO con la nota 2.
+        conn.execute(
+            "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, 'Entidad', 'concept')",
+            rusqlite::params![3i64, crate::db::keys::node_key("Entidad")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, type, weight) VALUES (2, 3, 'mentions', 1.0)",
+            [],
+        )
+        .unwrap();
+
+        let ollama = crate::embed::ollama::OllamaClient::new("http://localhost:11434", "test");
+        let hs = HybridSearch::new_internal(conn, ollama).unwrap();
+
+        // Resolver por la key exacta de la nota 2 → debe elegir la nota 2,
+        // expandiendo hasta su vecino 'Entidad'.
+        let by_key = hs
+            .graph_only(&crate::db::keys::note_key("b/dup.md"), 1)
+            .unwrap();
+        assert_eq!(by_key.len(), 1, "key exacta debe resolver la nota 2");
+        assert_eq!(by_key[0].label, "Entidad");
+
+        // Resolver por el label ambiguo no debe fallar y es determinista:
+        // gana la fila de menor `id` (la nota 1, sin aristas).
+        let by_label = hs.graph_only("Dup", 1).unwrap();
+        assert!(
+            by_label.is_empty(),
+            "label ambiguo → se resuelve al menor id (sin vecinos)"
         );
     }
 }

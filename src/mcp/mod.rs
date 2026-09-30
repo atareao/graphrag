@@ -761,8 +761,11 @@ fn handle_resource_nodes(db_path: &str, filter_type: Option<&str>) -> Result<Str
 
 fn handle_resource_node_by_label(db_path: &str, label: &str) -> Result<String> {
     let conn = rusqlite::Connection::open(db_path)?;
-    let mut stmt =
-        conn.prepare("SELECT id, label, type, metadata FROM nodes WHERE label = ?1 OR id = ?2")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, label, type, metadata FROM nodes \
+         WHERE key = ?1 OR label = ?1 OR id = ?2 \
+         ORDER BY (key = ?1) DESC, (label = ?1) DESC, id ASC LIMIT 1",
+    )?;
 
     let id_parse = label.parse::<i64>().unwrap_or(-1);
 

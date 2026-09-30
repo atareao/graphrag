@@ -9,6 +9,7 @@ use log::debug;
 use rusqlite::Connection;
 use serde_json::json;
 
+use crate::db::keys::{node_key, note_key};
 use crate::db::schema;
 use crate::embed::ollama::OllamaClient;
 use crate::vector;
@@ -204,8 +205,9 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
         let blob = vector::vector_to_blob(&emb);
 
         tx.execute(
-            "INSERT INTO nodes (label, type, embedding, metadata) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO nodes (key, label, type, embedding, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
+                node_key(&ent.label),
                 ent.label,
                 ent.r#type,
                 blob,
@@ -348,8 +350,9 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
         let blob = vector::vector_to_blob(&emb);
 
         tx.execute(
-            "INSERT INTO nodes (label, type, embedding, metadata) VALUES (?1, 'note', ?2, ?3)",
+            "INSERT INTO nodes (key, label, type, embedding, metadata) VALUES (?1, ?2, 'note', ?3, ?4)",
             rusqlite::params![
+                note_key(&nota.slug),
                 nota.label,
                 blob,
                 json!({"path": nota.slug, "content": nota.content}).to_string(),
@@ -360,8 +363,8 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
         // Retrieve the auto-generated id for this note.
         let note_id: i64 = tx
             .query_row(
-                "SELECT id FROM nodes WHERE label = ?1",
-                rusqlite::params![nota.label],
+                "SELECT id FROM nodes WHERE key = ?1",
+                rusqlite::params![note_key(&nota.slug)],
                 |row| row.get(0),
             )
             .with_context(|| format!("failed to find note id for '{}'", nota.label))?;
@@ -370,8 +373,8 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
         for ent_label in &nota.entities {
             let ent_id: i64 = tx
                 .query_row(
-                    "SELECT id FROM nodes WHERE label = ?1",
-                    rusqlite::params![ent_label],
+                    "SELECT id FROM nodes WHERE key = ?1",
+                    rusqlite::params![node_key(ent_label)],
                     |row| row.get(0),
                 )
                 .with_context(|| format!("failed to find entity id for '{ent_label}'"))?;
@@ -437,16 +440,16 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
     for (src, dst, weight) in &co_occurrences {
         let src_id: i64 = tx
             .query_row(
-                "SELECT id FROM nodes WHERE label = ?1",
-                rusqlite::params![src],
+                "SELECT id FROM nodes WHERE key = ?1",
+                rusqlite::params![node_key(src)],
                 |row| row.get(0),
             )
             .with_context(|| format!("failed to find src entity '{src}' for co-occurrence"))?;
 
         let dst_id: i64 = tx
             .query_row(
-                "SELECT id FROM nodes WHERE label = ?1",
-                rusqlite::params![dst],
+                "SELECT id FROM nodes WHERE key = ?1",
+                rusqlite::params![node_key(dst)],
                 |row| row.get(0),
             )
             .with_context(|| format!("failed to find dst entity '{dst}' for co-occurrence"))?;

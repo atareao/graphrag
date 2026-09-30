@@ -961,7 +961,8 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
 │      nodes       │       │        edges          │
 ├──────────────────┤       ├───────────────────────┤
 │ id        INT PK │──┐    │ source_id INT FK      │
-│ label     TEXT   │  └────┤ target_id INT FK      │
+│ key       TEXT UQ│  └────┤ target_id INT FK      │
+│ label     TEXT   │  ┌────┤ type       TEXT        │
 │ type      TEXT   │  ┌────┤ type       TEXT        │
 │ embedding BLOB  │  │    │ weight     REAL        │
 │ metadata  JSON  │  │    │ context    TEXT        │
@@ -976,6 +977,8 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
                       └────┤                       │
                            └───────────────────────┘
 ```
+
+**Node identity:** every node has a unique `key`. Notes use `key = "note:" + <relative path>`; entities, tags and directories use `key = "node:" + <label>`. This means two notes with the same title — and even a note whose title matches an entity — are stored as separate nodes instead of overwriting each other, so incremental builds converge.
 
 ---
 
