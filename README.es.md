@@ -127,6 +127,7 @@ graphrag <COMANDO> [ARGUMENTOS]
 |---------|-------------|
 | [`build`](#graphrag-build-repo-db) | 📥 Escanear archivos `.md` → extraer entidades → construir grafo |
 | [`search`](#graphrag-search-consulta-db) | 🔍 Búsqueda híbrida (vectores + grafo) |
+| [`ask`](#graphrag-ask-consulta-db) | 💡 RAG: responde preguntas con fuentes (retrieval + LLM) |
 | [`fts`](#graphrag-fts-consulta-db) | 📄 Búsqueda exacta FTS5 |
 | [`graph`](#graphrag-graph-etiqueta-db) | 🕸️ Mostrar vecinos de un nodo |
 | [`map`](#graphrag-map-db) | 🖥️ Mapa conceptual interactivo TUI |
@@ -223,6 +224,31 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--min-weight` | — | Peso mínimo de arista para expansión |
 | `--format` | `table` | Formato de salida: `table`, `list` o `json` |
 | `--ollama` | — | Usar Ollama para embeddings (por defecto: synthetic) |
+
+### `graphrag ask <CONSULTA> [DB]`
+
+RAG en un solo comando: retrieval híbrido + resúmenes de comunidades + evidencia de chunks → una respuesta en lenguaje natural fundamentada y generada con Ollama, con fuentes citadas.
+
+```bash
+graphrag ask "¿cómo configuro nginx?" notes.db
+graphrag ask "backups" notes.db -k 10 --filter 'date >= 2024'
+graphrag ask "nginx" notes.db --format json
+graphrag ask "nginx" notes.db --model gpt-oss:latest --communities 5
+```
+
+| Flag | Descripción |
+|:---|---|
+| `-k, --k` | Resultados de retrieval usados como evidencia (por defecto 5) |
+| `-d, --depth` | Profundidad de expansión en el grafo (por defecto 2; 0 = solo vectorial) |
+| `-a, --alpha` | Peso vectorial, 0.0–1.0 (por defecto 0.7) |
+| `--min-weight` | Peso mínimo de arista para la expansión |
+| `--notes-only` | Solo notas (oculta entidades y tags) |
+| `--filter` | Filtro de metadatos (repetible), p. ej. `'date >= 2023'` |
+| `--communities` | Máximo de resúmenes de comunidades en el contexto (por defecto 3) |
+| `--model` | Modelo de Ollama para la generación (por defecto: `summary_model` de la config) |
+| `--format` | Formato de salida: `table` \| `list` \| `json` |
+
+Si Ollama no responde, `ask` degrada a retrieval puro y sale con código 0. El contexto de comunidades requiere `graphrag community detect` seguido de `graphrag community summarize`. Con `--format json` la salida es `{ "answer", "sources", "results" }`.
 
 ### `graphrag similar --label <ETIQUETA> --file <RUTA> [DB]`
 
@@ -922,6 +948,7 @@ graphrag <COMMAND> [ARGS] [OPTIONS]
 |---------|-------------|
 | [`build`](#graphrag-build-repo-db) | 📥 Scan `.md` files → extract entities → build knowledge graph |
 | [`search`](#graphrag-search-query-db) | 🔍 Hybrid vector + graph search |
+| [`ask`](#graphrag-ask-query-db) | 💡 RAG: answer questions with sources (retrieval + LLM) |
 | [`fts`](#graphrag-fts-query-db) | 📄 Exact full-text search (FTS5) |
 | [`graph`](#graphrag-graph-label-db) | 🕸️ Show neighbors of a node |
 | [`path`](#graphrag-path-from-to-db) | 🔗 Shortest path between two nodes |
@@ -1092,6 +1119,33 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--filter` | — | Filter by metadata (repeatable). Format: `'field op value'` e.g. `--filter 'date >= 2023'` |
 | `--answer` | — | Narrative answer using community context (requires `community detect + summarize`) |
 | `--format` | `table` | Output format: `table`, `list`, or `json` |
+
+---
+
+### `graphrag ask <QUERY> [DB]`
+
+RAG in one command: hybrid retrieval + community summaries + chunk evidence → a grounded natural-language answer generated with Ollama, with cited sources.
+
+```bash
+graphrag ask "how do I configure nginx?" notes.db
+graphrag ask "backups" notes.db -k 10 --filter 'date >= 2024'
+graphrag ask "nginx" notes.db --format json
+graphrag ask "nginx" notes.db --model gpt-oss:latest --communities 5
+```
+
+| Flag | Description |
+|:---|---|
+| `-k, --k` | Retrieval results used as evidence (default 5) |
+| `-d, --depth` | Graph expansion depth (default 2; 0 = vector-only) |
+| `-a, --alpha` | Vector weight, 0.0–1.0 (default 0.7) |
+| `--min-weight` | Minimum edge weight for expansion |
+| `--notes-only` | Only notes (hide entities and tags) |
+| `--filter` | Metadata filter (repeatable), e.g. `'date >= 2023'` |
+| `--communities` | Max community summaries in the context (default 3) |
+| `--model` | Ollama model for generation (default: `summary_model` from config) |
+| `--format` | Output format: `table` \| `list` \| `json` |
+
+If Ollama is unreachable, `ask` degrades to plain retrieval and exits 0. Community context requires `graphrag community detect` followed by `graphrag community summarize`. With `--format json` the output is `{ "answer", "sources", "results" }`.
 
 ---
 

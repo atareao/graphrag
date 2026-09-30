@@ -423,6 +423,7 @@ graphrag <COMMAND> [ARGS] [OPTIONS]
 |---------|-------------|
 | [`build`](#graphrag-build-repo-db) | 📥 Scan `.md` files → extract entities → build knowledge graph |
 | [`search`](#graphrag-search-query-db) | 🔍 Hybrid vector + graph search |
+| [`ask`](#graphrag-ask-query-db) | 💡 RAG: answer questions with sources (retrieval + LLM) |
 | [`fts`](#graphrag-fts-query-db) | 📄 Exact full-text search (FTS5) |
 | [`graph`](#graphrag-graph-label-db) | 🕸️ Show neighbors of a node |
 | [`map`](#graphrag-map-db) | 🖥️ Interactive concept map TUI |
@@ -594,6 +595,33 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--filter` | — | Filter by metadata (repeatable). Format: `'field op value'` e.g. `--filter 'date >= 2023'` |
 | `--answer` | — | Narrative answer using community context (requires `community detect + summarize`) |
 | `--format` | `table` | Output format: `table`, `list`, or `json` |
+
+---
+
+### `graphrag ask <QUERY> [DB]`
+
+RAG in one command: hybrid retrieval + community summaries + chunk evidence → a grounded natural-language answer generated with Ollama, with cited sources.
+
+```bash
+graphrag ask "how do I configure nginx?" notes.db
+graphrag ask "backups" notes.db -k 10 --filter 'date >= 2024'
+graphrag ask "nginx" notes.db --format json
+graphrag ask "nginx" notes.db --model gpt-oss:latest --communities 5
+```
+
+| Flag | Description |
+|:---|---|
+| `-k, --k` | Retrieval results used as evidence (default 5) |
+| `-d, --depth` | Graph expansion depth (default 2; 0 = vector-only) |
+| `-a, --alpha` | Vector weight, 0.0–1.0 (default 0.7) |
+| `--min-weight` | Minimum edge weight for expansion |
+| `--notes-only` | Only notes (hide entities and tags) |
+| `--filter` | Metadata filter (repeatable), e.g. `'date >= 2023'` |
+| `--communities` | Max community summaries in the context (default 3) |
+| `--model` | Ollama model for generation (default: `summary_model` from config) |
+| `--format` | Output format: `table` \| `list` \| `json` |
+
+If Ollama is unreachable, `ask` degrades to plain retrieval and exits 0. Community context requires `graphrag community detect` followed by `graphrag community summarize`. With `--format json` the output is `{ "answer", "sources", "results" }`.
 
 ---
 
