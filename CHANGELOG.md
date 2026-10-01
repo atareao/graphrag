@@ -8,6 +8,7 @@
 ### Miscellaneous Tasks
 
 - *(release)* Eliminar dependencia de GH_PAT y arreglar bump/publicación
+- Release v0.2.8
 ## [0.2.7] - 2026-09-30
 
 ### Bug Fixes
