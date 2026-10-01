@@ -1,4 +1,13 @@
 # Changelog
+## [0.2.8] - 2026-10-01
+
+### Documentation
+
+- *(gitflow)* Actualizar sección de secretos (GITHUB_TOKEN, sin crates.io)
+
+### Miscellaneous Tasks
+
+- *(release)* Eliminar dependencia de GH_PAT y arreglar bump/publicación
 ## [0.2.7] - 2026-09-30
 
 ### Bug Fixes
@@ -21,6 +30,7 @@
 ### Miscellaneous Tasks
 
 - Sincronizar Cargo.lock con Cargo.toml (0.2.3 -> 0.2.5)
+- Release v0.2.7
 
 ### Testing
 
