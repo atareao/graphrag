@@ -1,2 +1,4 @@
 /target
 .codegraph
+# Variables de entorno locales
+.env
