@@ -1,9 +1,18 @@
 # Changelog
+## [0.2.11] - 2026-10-01
+
+### Bug Fixes
+
+- *(ci)* Refrescar Cargo.lock tras el bump de versión
 ## [0.2.10] - 2026-10-01
 
 ### Bug Fixes
 
 - *(ci)* Heredar secretos en el workflow reutilizable de release
+
+### Miscellaneous Tasks
+
+- Release v0.2.10
 ## [0.2.9] - 2026-10-01
 
 ### Miscellaneous Tasks
