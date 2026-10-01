@@ -150,7 +150,7 @@ Yes. GraphRAG is a **single Rust binary** that:
 - Doesn't need Python, Node.js, or Docker
 - Runs entirely on your machine, 100% local
 - Never sends your data to any server
-- If you don't have Ollama, uses synthetic embeddings (no external AI needed)
+- Uses a local Ollama server for AI — no cloud services, no internet required
 - The SQLite database is smaller than an MP3 and fully portable
 
 **In summary:** If you have hundreds of Markdown notes and you're tired of searching
@@ -228,7 +228,7 @@ Query "Python databases"
 | 🔄 | **Parallel NER** | N worker threads for entity extraction, 1 serial writer — no SQLite lock contention |
 | 🤖 | **MCP server** | Claude Desktop, Cline, and other AI assistants can query your graph in real-time |
 | 📝 | **Neovim plugin** | Search and insert related notes without leaving your editor |
-| 🚫 | **Zero external deps** | SQLite compiled statically. No Python, Node, Docker, or servers needed |
+| 🚫 | **Zero external deps** | SQLite compiled statically. No Python, Node, or Docker needed — Ollama runs locally |
 | 🔒 | **100% local & private** | Everything runs on your machine. No data ever leaves your computer |
 
 ---
@@ -239,27 +239,43 @@ Query "Python databases"
 # 1. Install
 cargo install graphrag-search
 
-# 2. Populate demo data (44 nodes, ~113 edges)
+# 2. Start Ollama and pull a model (required for AI features)
+ollama serve
+ollama pull nomic-embed-text   # embeddings used by seed and build
+
+# 3. Populate demo data (44 nodes, ~113 edges) — requires Ollama
 graphrag seed demo.db
 
-# 3. Search — finds notes semantically related to "Python"
+# 4. Hybrid search over the demo (requires Ollama)
 graphrag search "Python" demo.db -k 5
 
-# 4. Path — discovers how two technologies connect
+# 5. Text search — exact keyword search over the demo
+graphrag fts "Python" demo.db
+
+# 6. Path — discovers how two technologies connect
 graphrag path "Docker" "SQLite" demo.db
 # → Docker → virtualization → embedded-database → SQLite
 
-# 5. Graph — see what's connected to a concept
+# 7. Graph — see what's connected to a concept
 graphrag graph "machine-learning" demo.db -d 2
 
-# 6. Stats — understand your graph
+# 8. Stats — understand your graph
 graphrag stats demo.db
 ```
 
+> **Note:** `seed` embeds each demo note into a `chunks` row, so the demo
+> database is **immediately searchable**: `search`, `ask` and `similar --label`
+> return results on it (with Ollama running). To search your own notes instead,
+> build a graph with `graphrag build` (see [Build](#graphrag-build-repo-db)).
+
 ### Sample output
 
+The following comes from a database built with `graphrag build` over your own
+Markdown notes. You get the same shape of results from the demo database after
+`graphrag seed`.
+
 ```
-$ graphrag search "Python" demo.db -k 3
+$ graphrag search "Python" notes.db -k 3
 
 Results for "Python" (α=0.70, depth=2):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -282,27 +298,25 @@ Results for "Python" (α=0.70, depth=2):
 ### Full demo walkthrough
 
 ```bash
-# Create a database with demo data
+# Create a database with demo data (requires Ollama)
 graphrag seed graph.db
 
-# Hybrid search with graph expansion (depth 2)
+# The demo is immediately searchable — hybrid search, FTS, graph traversal and stats
 graphrag search "Docker security" graph.db -k 5
-
-# Search with narrative answer (requires community detect + summarize)
-graphrag community detect graph.db
-graphrag community summarize graph.db
-graphrag search "Docker security" graph.db --answer
-
-# Exact text search
 graphrag fts "Python" graph.db -l 10
-
-# Explore the graph
 graphrag graph "Docker" graph.db -d 1
 graphrag path "Python" "Docker" graph.db
 graphrag stats graph.db
 
 # Interactive concept map
 graphrag map graph.db
+
+# Build from your own notes for hybrid search and narrative answers (needs Ollama)
+graphrag build ~/notes graph.db
+graphrag search "Docker security" graph.db -k 5
+graphrag community detect graph.db
+graphrag community summarize graph.db
+graphrag search "Docker security" graph.db --answer
 
 # Clean up when done
 graphrag reset graph.db
@@ -331,10 +345,15 @@ cargo build --release
 
 **Requirements:** Rust ≥ 1.75 only. SQLite is compiled statically via `rusqlite` bundled feature — no system libraries needed.
 
-### Optional: Ollama setup
+### Ollama setup (required for AI features)
 
-GraphRAG works **without Ollama** using synthetic (deterministic hash-based) embeddings.
-For better results, install [Ollama](https://ollama.ai/) and pull the models you need:
+Ollama is **required for all AI features**: every embedding comes from Ollama,
+and entity extraction (NER) uses an Ollama LLM. Without a running Ollama server,
+only the commands that work on already-stored data or that don't use vectors are
+available: `init db`, `init neovim`, `reset`, `completions`, `stats`, `graph`,
+`path`, `map`, `fts`, `similar --label` and `community detect`.
+
+Install [Ollama](https://ollama.ai/) and pull the models you need:
 
 ```bash
 # Minimal setup (fast, works on any hardware)
@@ -346,6 +365,13 @@ ollama pull gemma4:e2b      # NER — 5.1B params, ~5GB VRAM
 ollama pull bge-m3          # Embeddings — 566M params, ~1GB VRAM
 ```
 
+| Purpose | Model | Params | VRAM |
+|:---|---:|:---:|:---:|
+| NER | `llama3.2:3b` | 3.2B | ~2GB |
+| NER | `gemma4:e2b` | 5.1B | ~5GB |
+| Embeddings | `nomic-embed-text` | 137M | ~0.5GB |
+| Embeddings | `bge-m3` | 566M | ~1GB |
+
 ---
 
 ## ⚙️ Configuration
@@ -354,41 +380,57 @@ GraphRAG auto-creates a config file at `~/.config/graphrag/config.toml` on first
 **All fields are optional** — CLI flags always override config values.
 
 ```toml
-# =============================================
-# GraphRAG configuration
-# =============================================
+# GraphRAG Configuration
+# Auto-generated. All fields are optional — CLI flags override these values.
 
-# --- Database ---
-db = "graph.db"                    # Default DB path
+# Default database path
+db = "graph.db"
 
-# --- Ollama connection ---
+# Ollama server URL
 ollama_url = "http://localhost:11434"
-embed_model = "bge-m3:latest"      # Embedding model
-ner_model = "gemma4:e2b"           # Entity extraction model
 
-# --- Search defaults ---
-k = 5                              # Results count
-depth = 2                          # Graph expansion hops
-alpha = 0.7                        # Vector weight (0=graph only, 1=vector only)
+# Embedding model
+embed_model = "bge-m3:latest"
 
-# --- Notes directory ---
-notes_dir = "~/notes"              # Used by `graphrag build` when no dir is given
+# Model for entity extraction during build
+ner_model = "llama3.2:3b"
 
-# --- Build ---
-num_threads = 4                    # Parallel NER workers
+# Model for community summarization
+summary_model = "llama3.2:3b"
+
+# Default number of search results
+k = 5
+
+# Default graph expansion depth
+depth = 2
+
+# Vector weight (0.0 = pure graph, 1.0 = pure vector)
+alpha = 0.7
+
+# Notes directory (used by the Neovim plugin and `graphrag build` when no dir is given)
+notes_dir = ""
+
+# Number of parallel threads for build (NER workers)
+num_threads = 4
 ```
+
+> The flag defaults shown by `--help` are `nomic-embed-text` / `llama3.2:3b`;
+> the auto-generated config above uses `bge-m3:latest` / `llama3.2:3b`.
 
 ### Practical config examples
 
 <details>
-<summary><b>📋 Minimal config (no Ollama, synthetic embeddings only)</b></summary>
+<summary><b>📋 Minimal config (local Ollama)</b></summary>
 
 ```toml
 db = "search.db"
 notes_dir = "~/notes"
 k = 10
 depth = 2
-# No Ollama fields — uses deterministic synthetic embeddings automatically
+# Point at your local Ollama server (defaults shown)
+ollama_url = "http://localhost:11434"
+embed_model = "bge-m3:latest"
+ner_model = "llama3.2:3b"
 ```
 
 </details>
@@ -423,6 +465,7 @@ graphrag <COMMAND> [ARGS] [OPTIONS]
 |---------|-------------|
 | [`build`](#graphrag-build-repo-db) | 📥 Scan `.md` files → extract entities → build knowledge graph |
 | [`search`](#graphrag-search-query-db) | 🔍 Hybrid vector + graph search |
+| [`similar`](#graphrag-similar---label-label---file-path-db) | 🧭 Find notes semantically similar to a note or an external file |
 | [`ask`](#graphrag-ask-query-db) | 💡 RAG: answer questions with sources (retrieval + LLM) |
 | [`fts`](#graphrag-fts-query-db) | 📄 Exact full-text search (FTS5) |
 | [`graph`](#graphrag-graph-label-db) | 🕸️ Show neighbors of a node |
@@ -441,7 +484,7 @@ graphrag <COMMAND> [ARGS] [OPTIONS]
 | [`mcp`](#graphrag-mcp) | 🤖 MCP server for AI assistants |
 | [`init db`](#graphrag-init-db-db) | 🆕 Create empty database |
 | [`init neovim`](#graphrag-init-neovim---output-path) | 📝 Generate Neovim plugin config |
-| [`completions`](#graphrag-completions-bashzshfish) | ⌨️ Shell completions (bash/zsh/fish) |
+| [`completions`](#graphrag-completions-bashelvishfishpowershellzsh) | ⌨️ Shell completions (bash/elvish/fish/powershell/zsh) |
 
 ---
 
@@ -503,7 +546,7 @@ After summarizing, use `graphrag search --answer` to get **narrative answers** g
 
 ---
 
-### `graphrag completions <bash|zsh|fish>`
+### `graphrag completions <bash|elvish|fish|powershell|zsh>`
 
 Generate shell completion scripts.
 
@@ -511,6 +554,8 @@ Generate shell completion scripts.
 graphrag completions bash > ~/.local/share/bash-completion/completions/graphrag
 graphrag completions zsh > _graphrag
 graphrag completions fish > graphrag.fish
+graphrag completions elvish > graphrag.elv
+graphrag completions powershell > graphrag.ps1
 ```
 
 ---
@@ -518,10 +563,19 @@ graphrag completions fish > graphrag.fish
 ### `graphrag seed [DB]`
 
 Populate a database with demo data (44 nodes: notes, entities, tags; ~113 edges).
+**Requires Ollama**: it generates the node and chunk embeddings with it. If Ollama
+is not running, the command fails with a connection error, leaves no DB file
+behind, and exits non-zero.
+
+`seed` inserts one chunk (with embedding) per demo note, so the demo database is
+**immediately searchable**: `search`, `ask` and `similar --label` return results
+on it while Ollama is running. You can also use `fts`, `graph`, `path`, `stats`
+and `map`. To search your own notes, build a graph with
+[`build`](#graphrag-build-repo-db).
 
 ```bash
 graphrag seed graph.db
-graphrag search "Docker security" graph.db -k 5
+graphrag fts "Python" graph.db
 ```
 
 | Flag | Default | Description |
@@ -628,7 +682,7 @@ If Ollama is unreachable, `ask` degrades to plain retrieval and exits 0. Communi
 ### `graphrag similar --label <LABEL> --file <PATH> [DB]`
 
 Find semantically similar notes. Two modes:
-- `--label`: find notes similar to an **existing** indexed note (no Ollama needed — uses stored embeddings)
+- `--label`: find notes similar to an **existing** indexed note (uses stored embeddings — Ollama not required)
 - `--file`: find notes similar to an **external** `.md` file (chunks and embeds via Ollama)
 
 Both modes use **match individual**: each chunk of the source is compared independently, and each target note is scored by its best-matching chunk pair.
@@ -717,11 +771,15 @@ Shortest path between two nodes — discovers how concepts connect.
 ```bash
 graphrag path "Python" "Docker" graph.db
 # → Python → web-development → containerization → Docker
+
+graphrag path "Python" "Docker" graph.db -m 5
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-d` | 10 | Maximum traversal depth |
+| `-m, --max-depth` | 10 | Maximum traversal depth |
+
+> **Note:** the flag is `-m`, not `-d`.
 
 ---
 
@@ -928,21 +986,24 @@ Expose your knowledge graph to any MCP-compatible AI assistant (Claude Desktop, 
 ```
 📦 graphrag  (single ~6.5 MB binary)
 ├── src/
-│   ├── main.rs              ← CLI entrypoint (clap, 12 subcommands)
+│   ├── main.rs              ← CLI entrypoint (clap, 15 subcommands)
 │   ├── config.rs            ← TOML config (auto-created, all fields optional)
 │   ├── mcp/mod.rs           ← MCP server (stdio, JSON-RPC 2.0)
 │   ├── db/
-│   │   └── schema.rs        ← SQLite schema + FTS5 virtual table
+│   │   ├── schema.rs        ← SQLite schema + FTS5 virtual table
+│   │   ├── keys.rs          ← Node identity ("note:<path>" / "node:<label>")
+│   │   ├── chunks.rs        ← Chunk storage and lookups
+│   │   └── communities.rs   ← Community storage and lookups
 │   ├── graph/
 │   │   ├── build.rs         ← Incremental build (parallel NER, serial writer)
 │   │   └── expand.rs        ← Recursive CTE expansion + shortest path
 │   ├── search/
-│   │   └── hybrid.rs        ← 3-phase hybrid search engine
+│   │   ├── hybrid.rs        ← 3-phase hybrid search engine
+│   │   └── filter.rs        ← Metadata filter DSL (`--filter`)
 │   ├── embed/
 │   │   └── ollama.rs        ← Ollama HTTP client (blocking reqwest)
 │   ├── vector/
-│   │   ├── mod.rs           ← f32 ↔ BLOB, cosine similarity
-│   │   └── synthetic.rs     ← Deterministic hash-based embeddings
+│   │   └── mod.rs           ← f32 ↔ BLOB, cosine similarity
 │   ├── chunking/
 │   │   └── markdown.rs      ← Frontmatter parsing + section chunking
 │   ├── ner/
@@ -951,6 +1012,10 @@ Expose your knowledge graph to any MCP-compatible AI assistant (Claude Desktop, 
 │   │   ├── mod.rs           ← Data loading (load_graph, cmd_map)
 │   │   ├── layout.rs        ← Force-directed layout algorithm
 │   │   └── tui.rs           ← Interactive TUI (ratatui)
+│   ├── community/
+│   │   ├── detect.rs        ← Leiden community detection
+│   │   ├── summarize.rs     ← LLM summaries per community
+│   │   └── search.rs        ← Community-aware retrieval for `--answer`
 │   └── seed/
 │       └── demo_data.rs     ← Demo data generator (44 nodes, 113 edges)
 ```
@@ -977,9 +1042,9 @@ BUILD PIPELINE:
 SEARCH PIPELINE:
 Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
   │        │           │               │            │              │
-  │    Ollama or   Top-K scores    +title      Recursive     Hybrid score
-  │    synthetic   by semantic     +type       CTE from      + content
-  │                 similarity     +alpha      candidates    + neighbors
+  │    Ollama     Top-K chunk      +title      Recursive     Hybrid score
+  │              embeddings by     +type       CTE from      + content
+  │              similarity         +alpha      candidates    + neighbors
 ```
 
 ### Database schema
@@ -1029,7 +1094,6 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
 | First build | 100 | ~20 min | With `gemma4:e2b`, 4 threads |
 | First build | 6254 | ~22 h | Large docs repo |
 | Incremental | 1 changed | ~2 s | Only re-processes modified files |
-| No Ollama | any | ~5 s | Synthetic embeddings, no NER |
 
 > **Tip:** The first build is the slowest (NER is LLM-bound). Subsequent builds are
 > near-instant because only new/modified files are processed.
@@ -1038,7 +1102,6 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
 
 | Setup | RAM | Notes |
 |:---|---:|:---|
-| No Ollama (synthetic) | ~15 MB | Minimal |
 | With `nomic-embed-text` | ~500 MB | + Ollama process |
 | With `bge-m3` | ~1.5 GB | + Ollama process |
 | With `gemma4:e2b` (NER) | ~5 GB | + Ollama process |
@@ -1048,10 +1111,10 @@ Query → Embed → Cosine similarity → Rerank → Graph expansion → Results
 ## 🧪 Tests
 
 ```bash
-# All tests (123 tests, no external services needed)
+# All tests (143 passed, 15 ignored — no external services needed)
 cargo test
 
-# Ollama-dependent tests (2 tests, requires Ollama running)
+# Ollama-dependent tests (15 tests, requires Ollama running)
 cargo test -- --ignored
 
 # Lint
@@ -1073,8 +1136,10 @@ Tests use `tempfile` for temporary databases — no cleanup needed.
 Error: connection refused
 ```
 
-GraphRAG works without Ollama using synthetic embeddings. If you want Ollama
-for better results:
+Ollama is mandatory for `seed`, `search`, `similar --file` and
+`community summarize` — they fail if it is down. `build` continues but leaves
+notes without entities or chunk embeddings, and `ask` degrades to plain retrieval.
+Start it and verify it is reachable:
 
 ```bash
 # Start Ollama
@@ -1134,8 +1199,11 @@ db = "graphrag.db"
 
 <details>
 <summary><b>Does GraphRAG need Ollama?</b></summary>
-No. Without Ollama, GraphRAG uses deterministic synthetic embeddings (hash-based).
-Search still works — just without the semantic quality that LLM embeddings provide.
+Yes — Ollama is required for all AI features. All embeddings and entity
+extraction go through Ollama, so `seed`, `build`, `search`, `ask`, `similar --file` and
+`community summarize` require it. The commands that work on already-stored data
+or don't use vectors do not: `init db`, `init neovim`, `reset`, `completions`,
+`stats`, `graph`, `path`, `map`, `fts`, `similar --label` and `community detect`.
 </details>
 
 <details>
@@ -1155,8 +1223,9 @@ binary, works entirely offline.
 <details>
 <summary><b>Can I share the database between machines?</b></summary>
 Yes — the SQLite database is portable. Copy it between machines and it works.
-Synthetic embeddings are deterministic (same text = same vector), so builds
-are reproducible across machines.
+Bear in mind that the stored embeddings depend on the Ollama embedding model
+that produced them; for consistent results, use the same `embed_model` on both
+machines.
 </details>
 
 <details>
