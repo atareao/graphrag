@@ -43,6 +43,11 @@ jobs:
           echo "type=$type" >> "$GITHUB_OUTPUT"
       - name: Bump version with vampus
         run: vampus upgrade ${{ steps.bump.outputs.type }}
+      - name: Refresh Cargo.lock
+        # vampus solo reescribe Cargo.toml. Si Cargo.lock se queda desfasado,
+        # `cargo publish` lo regenera al vuelo, lo detecta como cambio sin
+        # commitear y aborta con "files in the working directory contain changes".
+        run: cargo update --workspace
       - name: Get new version
         id: version
         run: |
