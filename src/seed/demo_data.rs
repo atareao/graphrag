@@ -33,17 +33,50 @@ struct Entidad {
     description: String,
 }
 
+/// The data needed to persist one `chunks` row derived from a [`Nota`].
+struct ChunkData {
+    /// Markdown heading for the chunk (the note title).
+    header: String,
+    /// Raw chunk text (the note content).
+    text: String,
+    /// Slug for the chunk. In the demo this is the human-readable note
+    /// title (with spaces/accents), not a URL-safe slug.
+    slug: String,
+    /// Flat f32 BLOB of the chunk embedding.
+    embedding_blob: Vec<u8>,
+}
+
+/// Build the [`ChunkData`] for `nota` from an already-serialised embedding BLOB.
+///
+/// `header` mirrors the note label, `text` the note content and `slug` the
+/// note slug; `embedding_blob` is the flat f32 BLOB for the embedding
+/// (taken by value to avoid an extra serialisation/clone at the call site).
+fn build_chunk_data(nota: &Nota, embedding_blob: Vec<u8>) -> ChunkData {
+    ChunkData {
+        header: nota.label.clone(),
+        text: nota.content.clone(),
+        slug: nota.slug.clone(),
+        embedding_blob,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Creates a demo SQLite database at `path` with 24 entities, 20 notes,
-/// and ~80 edges (both `mentioned_in` and `co_occurs_with` relationships).
+/// ~80 edges (both `mentioned_in` and `co_occurs_with` relationships) and
+/// one searchable `chunk` per note (with an Ollama embedding), so that
+/// `search`/`ask`/`similar` work on a freshly seeded database.
 ///
 /// The database is freshly created — any existing file at `path` is
 /// removed first.  The schema is initialised via [`schema::init_db`],
-/// and then all nodes and edges are inserted inside a single transaction
-/// for performance.
+/// and then all nodes, chunks and edges are inserted inside a single
+/// transaction for performance.
+///
+/// This is **atomic**: if it returns an error at any point, the freshly
+/// created database file (and its `-wal`/`-shm` companions) is removed so
+/// no partially-populated database is left behind.
 ///
 /// Requires a running Ollama server for embeddings.
 ///
@@ -59,11 +92,33 @@ struct Entidad {
 /// create_demo_db("/tmp/demo.graphrag.db", "http://localhost:11434", "nomic-embed-text")?;
 /// ```
 pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result<()> {
-    // Remove an existing database so we start clean.
+    // Remove any pre-existing database so we start clean.
+    remove_db_files(path);
+
+    // Populate inside an inner function so the `Connection` is dropped
+    // (closing the file) before we clean up on failure.
+    let result = create_demo_db_inner(path, ollama_url, embed_model);
+
+    if result.is_err() {
+        // Never leave a partially-populated database on disk.
+        remove_db_files(path);
+    }
+
+    // Propagate the original error untouched (e.g. "Error connecting to Ollama").
+    result
+}
+
+/// Delete a database file together with its `-wal`/`-shm` companions,
+/// ignoring errors (the files may simply not exist).
+fn remove_db_files(path: &str) {
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}-wal"));
     let _ = std::fs::remove_file(format!("{path}-shm"));
+}
 
+/// Body of [`create_demo_db`], kept separate so the caller can drop the
+/// connection before removing a failed database file.
+fn create_demo_db_inner(path: &str, ollama_url: &str, embed_model: &str) -> Result<()> {
     let conn = Connection::open(path).context("failed to open database")?;
     schema::init_db(&conn).context("failed to initialise schema")?;
 
@@ -349,12 +404,16 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
         let emb = ollama.embed(&nota.content)?;
         let blob = vector::vector_to_blob(&emb);
 
+        // Build the chunk data up-front so the serialised embedding BLOB is
+        // shared with the note node insert below (no duplicate serialisation).
+        let chunk = build_chunk_data(nota, blob);
+
         tx.execute(
             "INSERT INTO nodes (key, label, type, embedding, metadata) VALUES (?1, ?2, 'note', ?3, ?4)",
             rusqlite::params![
                 note_key(&nota.slug),
                 nota.label,
-                blob,
+                chunk.embedding_blob.as_slice(),
                 json!({"path": nota.slug, "content": nota.content}).to_string(),
             ],
         )
@@ -368,6 +427,19 @@ pub fn create_demo_db(path: &str, ollama_url: &str, embed_model: &str) -> Result
                 |row| row.get(0),
             )
             .with_context(|| format!("failed to find note id for '{}'", nota.label))?;
+
+        // Persist a searchable chunk for this note, reusing both the
+        // embedding (no extra Ollama call) and its serialised BLOB.
+        crate::db::chunks::insert_chunk(
+            &tx,
+            note_id,
+            &chunk.header,
+            &chunk.text,
+            &chunk.slug,
+            Some(chunk.embedding_blob.as_slice()),
+            None,
+        )
+        .with_context(|| format!("failed to insert chunk for '{}'", nota.label))?;
 
         // Edges: entity ──mentioned_in──> note
         for ent_label in &nota.entities {
@@ -606,6 +678,93 @@ mod tests {
         assert_eq!(
             count, 20,
             "expected 20 rows in notes_fts (one per note), got {count}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // RED-1: pure helper associating a note with its chunk data.
+    // No Ollama required — the embedding is precomputed by the test.
+    // ------------------------------------------------------------------
+
+    /// `build_chunk_data` must map a note (and its precomputed embedding)
+    /// onto a `ChunkData` whose fields mirror the note and whose embedding
+    /// BLOB is non-empty.
+    #[test]
+    fn build_chunk_data_matches_note() {
+        let nota = Nota {
+            label: "Nota de prueba".into(),
+            slug: "Nota de prueba".into(),
+            content: "Contenido suficientemente largo para un chunk de demo.".into(),
+            entities: vec![],
+        };
+        let embedding: Vec<f32> = vec![0.1, -0.2, 0.3, 0.4];
+        let expected_blob = vector::vector_to_blob(&embedding);
+
+        let data = build_chunk_data(&nota, expected_blob.clone());
+
+        assert_eq!(data.header, nota.label, "header must equal the note label");
+        assert_eq!(data.text, nota.content, "text must equal the note content");
+        assert_eq!(data.slug, nota.slug, "slug must equal the note slug");
+        assert_eq!(
+            data.embedding_blob, expected_blob,
+            "embedding blob must be the exact serialisation of the embedding"
+        );
+
+        let round_trip = vector::blob_to_vector(&data.embedding_blob)
+            .expect("blob must deserialise back to f32s");
+        assert_eq!(
+            round_trip, embedding,
+            "blob round-trip must yield the original embedding"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // RED-2: `seed` must persist one searchable chunk per note.
+    // Requires Ollama; fails today because `create_demo_db` never writes
+    // to the `chunks` table.
+    // ------------------------------------------------------------------
+
+    /// The demo database must contain one chunk per note (20), each with a
+    /// non-NULL embedding, so that `search`/`ask`/`similar` are usable on a
+    /// freshly seeded database. Requires Ollama.
+    #[test]
+    #[ignore = "needs Ollama"]
+    fn test_seed_creates_chunk_embeddings() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_str().unwrap();
+
+        create_demo_db(path, "http://localhost:11434", "bge-m3:latest").unwrap();
+
+        let conn = Connection::open(path).unwrap();
+
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            chunks, 20,
+            "expected 20 chunks (one per note), got {chunks}"
+        );
+
+        let null_or_empty: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NULL OR length(embedding) = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_or_empty, 0,
+            "no chunk embedding should be NULL or empty, got {null_or_empty}"
+        );
+
+        let distinct_notes: i64 = conn
+            .query_row("SELECT COUNT(DISTINCT note_id) FROM chunks", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            distinct_notes, 20,
+            "chunks must belong to 20 distinct notes, got {distinct_notes}"
         );
     }
 }
