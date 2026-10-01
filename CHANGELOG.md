@@ -1,4 +1,14 @@
 # Changelog
+## [0.2.10] - 2026-10-01
+
+### Bug Fixes
+
+- *(ci)* Heredar secretos en el workflow reutilizable de release
+## [0.2.9] - 2026-10-01
+
+### Miscellaneous Tasks
+
+- Release v0.2.9
 ## [0.2.8] - 2026-10-01
 
 ### Documentation
