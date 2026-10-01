@@ -134,6 +134,12 @@ Always prefix your progress updates with the current status tag:
 
 Single Rust binary (`graphrag`). Hybrid search engine: vector embeddings + knowledge graph over Markdown notes. No Python, no npm, no servers.
 
+**Publicado en crates.io como `graphrag-search`** (el nombre `graphrag` pertenece a otro proyecto). El binario sigue llamándose `graphrag`:
+
+```bash
+cargo install graphrag-search   # instalación desde el registro
+```
+
 ### Quick start
 
 ```bash
@@ -152,11 +158,14 @@ cargo build --release
 | `build <repo> <db>` | Scan `.md` dir, extract entities via Ollama NER, build graph. Default repo: `.` |
 | `search <query> <db>` | Hybrid search (vectors + graph expansion) |
 | `ask <query> <db>` | RAG: hybrid retrieval + communities → Ollama answer with cited sources |
+| `similar [--label <l>\|--file <f>] <db>` | Similarity search: notes similar to an existing label or an external `.md` file |
 | `fts <query> <db>` | FTS5 exact-text search |
 | `graph <label> <db>` | Show neighbors of a node |
 | `path <from> <to> <db>` | Shortest path between two nodes |
 | `stats <db>` | Graph statistics |
 | `reset <db>` | Delete DB and recreate empty (rm + init) |
+| `map` | Interactive concept map TUI |
+| `community` | Community detection and summarization |
 | `mcp --db <db>` | MCP server over stdio (JSON-RPC 2.0) |
 | `completions <shell>` | Generate shell completions (bash/zsh/fish) |
 
@@ -169,6 +178,7 @@ cargo build --release
 | `-a` | search | 0.7 | Vector weight (0.0=pure graph, 1.0=pure vector) |
 | `--notes-only` | search | false | Show only notes (no entities/tags) |
 | `--min-weight` | search | none | Filter edges by minimum weight |
+| `--format` | search, similar, fts, ask | table | Output format: `table`, `list` (markdown links to notes), `json` |
 | `--communities` | ask | 3 | Max community summaries in RAG context |
 | `--model` | ask | config summary_model | Ollama model for answer generation |
 | `--ollama-url` | build, search, mcp | `http://localhost:11434` | |
@@ -181,7 +191,7 @@ cargo build --release
 
 ```
 src/
-├── main.rs              ← CLI entrypoint (clap, 11 subcommands)
+├── main.rs              ← CLI entrypoint (clap, 15 subcommands)
 ├── config.rs            ← TOML config (XDG: ~/.config/graphrag/config.toml, auto-created)
 ├── db/schema.rs         ← SQLite schema + FTS5 (no triggers)
 ├── db/keys.rs           ← Identidad de nodos: note:<ruta> / node:<label>
