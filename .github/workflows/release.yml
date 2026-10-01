@@ -4,6 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag a compilar y publicar (p.ej. v0.2.7)"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag a compilar y publicar"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,6 +38,8 @@ jobs:
             archive: tar.gz
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -57,14 +71,14 @@ jobs:
           merge-multiple: true
       - name: Generate release body
         run: |
-          cat > notes.md <<'EOF'
+          cat > notes.md <<'BODY'
           ## graphrag
 
           ### Downloads
 
           | Architecture | File |
           |---|---|
-          EOF
+          BODY
           for f in *.*; do
             [[ "$f" == *.md ]] && continue
             [[ "$f" == *.txt ]] && continue
@@ -75,18 +89,16 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: graphrag ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: graphrag ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
           files: |
             *.tar.gz
           generate_release_notes: true
 
-  publish:
-    needs: [build]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Publish to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+  # NOTA: el job `publish` a crates.io se eliminó a propósito.
+  # El nombre `graphrag` en crates.io pertenece a OTRO proyecto
+  # (https://github.com/automataIA/graphrag-rs), así que `cargo publish`
+  # siempre fallaba. La distribución es vía GitHub Releases.
+  # Si algún día se quiere publicar, hay que renombrar el crate en Cargo.toml
+  # y volver a añadir un job `publish` con CARGO_REGISTRY_TOKEN.
