@@ -237,7 +237,7 @@ Query "Python databases"
 
 ```bash
 # 1. Install
-cargo install graphrag
+cargo install graphrag-search
 
 # 2. Populate demo data (44 nodes, ~113 edges)
 graphrag seed demo.db
@@ -315,7 +315,7 @@ graphrag reset graph.db
 ### From crates.io (recommended)
 
 ```bash
-cargo install graphrag
+cargo install graphrag-search
 ```
 
 ### From source

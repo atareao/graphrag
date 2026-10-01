@@ -1,5 +1,5 @@
 [package]
-name = "graphrag"
+name = "graphrag-search"
 version = "0.2.8"
 edition = "2021"
 description = "GraphRAG — Hybrid search engine: vector embeddings + knowledge graph over Markdown notes. 100% local, single Rust binary."
@@ -7,9 +7,33 @@ authors = ["atareao <lorenzo@atareao.es>"]
 license = "MIT"
 repository = "https://github.com/atareao/graphrag"
 homepage = "https://github.com/atareao/graphrag"
-keywords = ["graphrag", "search", "embeddings", "knowledge-graph", "rag", "markdown", "ollama", "semantic-search"]
+documentation = "https://docs.rs/graphrag-search"
+# crates.io limita a 5 keywords
+keywords = ["graphrag", "search", "embeddings", "knowledge-graph", "rag"]
 categories = ["command-line-utilities", "database", "text-processing"]
 readme = "README.md"
+# No empaquetar en el crate publicado: configuración local, docs del repo, CI, etc.
+exclude = [
+    ".env",
+    ".codegraph",
+    ".opencode",
+    ".github",
+    ".vampus.yml",
+    "openspec",
+    "target",
+    "ubuntu",
+    "AGENTS.md",
+    "GIT_FLOW.md",
+    "GUIA_USUARIO.md",
+    "PLAN.md",
+    "README.es.md",
+    "cliff.toml",
+]
+
+# El paquete se publica como `graphrag-search`, pero el binario sigue siendo `graphrag`.
+[[bin]]
+name = "graphrag"
+path = "src/main.rs"
 
 [dependencies]
 # CLI

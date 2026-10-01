@@ -7,15 +7,25 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag a compilar y publicar (p.ej. v0.2.7)"
+        description: "Tag a compilar y publicar (p.ej. v0.3.0)"
         required: true
         type: string
+      publish:
+        description: "Publicar también en crates.io"
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       tag:
         description: "Tag a compilar y publicar"
         required: true
         type: string
+      publish:
+        description: "Publicar también en crates.io"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -96,9 +106,43 @@ jobs:
             *.tar.gz
           generate_release_notes: true
 
-  # NOTA: el job `publish` a crates.io se eliminó a propósito.
-  # El nombre `graphrag` en crates.io pertenece a OTRO proyecto
-  # (https://github.com/automataIA/graphrag-rs), así que `cargo publish`
-  # siempre fallaba. La distribución es vía GitHub Releases.
-  # Si algún día se quiere publicar, hay que renombrar el crate en Cargo.toml
-  # y volver a añadir un job `publish` con CARGO_REGISTRY_TOKEN.
+  # Publicación en crates.io.
+  # El PAQUETE se llama `graphrag-search` porque el nombre `graphrag` está ocupado
+  # por otro proyecto (https://github.com/automataIA/graphrag-rs), pero el BINARIO
+  # sigue llamándose `graphrag` (ver [[bin]] en Cargo.toml). Instalación:
+  #   cargo install graphrag-search
+  #
+  # El job se salta a sí mismo (con aviso, sin fallar) si:
+  #   - no está configurado el secreto CARGO_REGISTRY_TOKEN, o
+  #   - la versión ya estaba publicada en crates.io.
+  publish:
+    name: crates.io
+    needs: [build]
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN no está configurado; se omite la publicación en crates.io."
+            exit 0
+          fi
+          set +e
+          OUT=$(cargo publish --token "$CARGO_REGISTRY_TOKEN" 2>&1)
+          STATUS=$?
+          echo "$OUT"
+          if [ $STATUS -ne 0 ]; then
+            if echo "$OUT" | grep -qiE "already (uploaded|exists)"; then
+              echo "::warning::La versión ya estaba publicada en crates.io; se considera éxito."
+              exit 0
+            fi
+            exit $STATUS
+          fi
