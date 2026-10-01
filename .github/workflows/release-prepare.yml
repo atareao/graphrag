@@ -9,15 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  prepare:
     if: "!startsWith(github.event.head_commit.message, 'chore: release')"
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           fetch-tags: true
-          token: ${{ github.token }}
       - name: Install git-cliff
         uses: taiki-e/install-action@v2
         with:
@@ -31,13 +32,15 @@ jobs:
         run: |
           LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD | head -1)
           COMMITS=$(git log "$LAST_TAG"..HEAD --format="%s")
-          if echo "$COMMITS" | grep -q "BREAKING CHANGE\|!:"; then
-            echo "type=--major" >> "$GITHUB_OUTPUT"
-          elif echo "$COMMITS" | grep -q "^feat"; then
-            echo "type=--minor" >> "$GITHUB_OUTPUT"
+          # Gitmoji-aware: los commits empiezan por emoji (✨ feat, 🐛 fix, 💥 breaking).
+          if echo "$COMMITS" | grep -qE "BREAKING CHANGE|💥|!:"; then
+            type=--major
+          elif echo "$COMMITS" | grep -qE "^✨|^feat"; then
+            type=--minor
           else
-            echo "type=--patch" >> "$GITHUB_OUTPUT"
+            type=--patch
           fi
+          echo "type=$type" >> "$GITHUB_OUTPUT"
       - name: Bump version with vampus
         run: vampus upgrade ${{ steps.bump.outputs.type }}
       - name: Get new version
@@ -48,13 +51,10 @@ jobs:
       - name: Generate changelog
         run: git-cliff -o CHANGELOG.md --tag "v${{ steps.version.outputs.value }}"
       - name: Commit, tag and push
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           V="${{ steps.version.outputs.value }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git add -A
           git commit -m "chore: release v${V}"
           git tag "v${V}"
@@ -62,8 +62,17 @@ jobs:
           git push origin "v${V}"
       - name: Sync development with main
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh api -X PATCH repos/${{ github.repository }}/git/refs/heads/development \
             -f sha=$(git rev-parse HEAD) \
             -F force=true
+
+  # Llama al workflow reutilizable en lugar de depender de que el push del tag
+  # dispare release.yml (los pushes hechos con GITHUB_TOKEN no disparan workflows).
+  # Así no hace falta ningún PAT: basta con el GITHUB_TOKEN (contents: write).
+  release:
+    needs: [prepare]
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: v${{ needs.prepare.outputs.version }}
