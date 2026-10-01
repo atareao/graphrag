@@ -81,14 +81,17 @@ El formato determina el bump automático:
 
 - **`ci.yml`** — PR a main/development: formato, lint, build, tests
 - **`release-prepare.yml`** — push a main: bump version, changelog, tag, sincroniza development
-- **`release.yml`** — tag v*: compila multi-plataforma, publica en crates.io, GitHub Release
+- **`release.yml`** — tag `v*` o manual: compila multi-plataforma y crea el GitHub Release (no publica en crates.io: el nombre `graphrag` está ocupado por otro proyecto)
 
-## Secretos de GitHub necesarios
+## Secretos de GitHub
 
-| Secreto | Propósito |
-|---|---|
-| `GH_PAT` | Personal Access Token con scope `contents: write` |
-| `CARGO_REGISTRY_TOKEN` | Token de API de crates.io (generar en https://crates.io/settings/tokens) |
+No se necesitan secretos: la automatización usa el `GITHUB_TOKEN` del repositorio
+(`permissions: contents: write`). `release-prepare.yml` invoca `release.yml` como
+workflow reutilizable (`workflow_call`), de modo que no depende de un PAT para
+disparar la publicación al crear el tag.
+
+> La publicación en crates.io está deshabilitada porque el nombre `graphrag` ya está
+> ocupado en crates.io por otro proyecto. La distribución es vía GitHub Releases.
 
 ## Resumen visual
 
