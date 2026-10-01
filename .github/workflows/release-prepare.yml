@@ -77,3 +77,6 @@ jobs:
     with:
       tag: v${{ needs.prepare.outputs.version }}
       publish: true
+    # En workflows reutilizables los secretos NO se heredan solos:
+    # sin esto, CARGO_REGISTRY_TOKEN llega vacío y `publish` se omite.
+    secrets: inherit
