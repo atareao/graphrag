@@ -1,9 +1,18 @@
 # Changelog
+## [0.2.12] - 2026-10-01
+
+### Documentation
+
+- *(agents)* Reflejar crates.io, comandos y flags reales
 ## [0.2.11] - 2026-10-01
 
 ### Bug Fixes
 
 - *(ci)* Refrescar Cargo.lock tras el bump de versión
+
+### Miscellaneous Tasks
+
+- Release v0.2.11
 ## [0.2.10] - 2026-10-01
 
 ### Bug Fixes
@@ -20,16 +29,6 @@
 - Release v0.2.9
 ## [0.2.8] - 2026-10-01
 
-### Documentation
-
-- *(gitflow)* Actualizar sección de secretos (GITHUB_TOKEN, sin crates.io)
-
-### Miscellaneous Tasks
-
-- *(release)* Eliminar dependencia de GH_PAT y arreglar bump/publicación
-- Release v0.2.8
-## [0.2.7] - 2026-09-30
-
 ### Bug Fixes
 
 - *(build)* Identificar notas por ruta (key) y migrar esquema a v2
@@ -42,6 +41,7 @@
 - *(openspec)* Proponer change add-ask-rag-command
 - *(openspec)* Archivar change add-ask-rag-command
 - Documentar `graphrag ask` (README EN/ES, AGENTS.md)
+- *(gitflow)* Actualizar sección de secretos (GITHUB_TOKEN, sin crates.io)
 
 ### Features
 
@@ -51,6 +51,8 @@
 
 - Sincronizar Cargo.lock con Cargo.toml (0.2.3 -> 0.2.5)
 - Release v0.2.7
+- *(release)* Eliminar dependencia de GH_PAT y arreglar bump/publicación
+- Release v0.2.8
 
 ### Testing
 
@@ -60,7 +62,6 @@
 ### Miscellaneous Tasks
 
 - Release v0.2.6
-## [0.4.0] - 2026-09-26
 
 ### Other
 
@@ -87,11 +88,6 @@
 - Column layout with auto-focus, Enter previews notes
 ## [0.2.4] - 2026-09-25
 
-### Miscellaneous Tasks
-
-- Release v0.2.4
-## [0.3.0] - 2026-09-25
-
 ### Documentation
 
 - Add Spanish README (README.es.md)
@@ -110,6 +106,7 @@
 - Resolve merge conflict in README.es.md
 - Release v0.3.0 (#10)
 - Release v0.3.0
+- Release v0.2.4
 ## [0.2.3] - 2026-09-25
 
 ### Bug Fixes

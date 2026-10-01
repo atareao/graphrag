@@ -1,6 +1,6 @@
 [package]
 name = "graphrag-search"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2021"
 description = "GraphRAG — Hybrid search engine: vector embeddings + knowledge graph over Markdown notes. 100% local, single Rust binary."
 authors = ["atareao <lorenzo@atareao.es>"]
