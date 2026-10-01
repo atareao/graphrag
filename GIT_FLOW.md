@@ -81,17 +81,21 @@ El formato determina el bump automático:
 
 - **`ci.yml`** — PR a main/development: formato, lint, build, tests
 - **`release-prepare.yml`** — push a main: bump version, changelog, tag, sincroniza development
-- **`release.yml`** — tag `v*` o manual: compila multi-plataforma y crea el GitHub Release (no publica en crates.io: el nombre `graphrag` está ocupado por otro proyecto)
+- **`release.yml`** — tag `v*`, manual o reutilizable: compila multi-plataforma, crea el GitHub Release y (opcional) publica en crates.io como `graphrag-search`
 
 ## Secretos de GitHub
 
-No se necesitan secretos: la automatización usa el `GITHUB_TOKEN` del repositorio
-(`permissions: contents: write`). `release-prepare.yml` invoca `release.yml` como
-workflow reutilizable (`workflow_call`), de modo que no depende de un PAT para
-disparar la publicación al crear el tag.
+La automatización de releases usa el `GITHUB_TOKEN` del repositorio
+(`permissions: contents: write`); no se necesita ningún PAT: `release-prepare.yml`
+invoca `release.yml` como workflow reutilizable (`workflow_call`).
 
-> La publicación en crates.io está deshabilitada porque el nombre `graphrag` ya está
-> ocupado en crates.io por otro proyecto. La distribución es vía GitHub Releases.
+| Secreto | ¿Obligatorio? | Propósito |
+|---|---|---|
+| `CARGO_REGISTRY_TOKEN` | No | Publicar en crates.io. Si no está definido, el job `publish` se omite mostrando un aviso |
+
+> El crate se publica como **`graphrag-search`** (el nombre `graphrag` está ocupado en
+> crates.io por otro proyecto). El binario sigue llamándose `graphrag`, así que la
+> instalación es `cargo install graphrag-search`.
 
 ## Resumen visual
 

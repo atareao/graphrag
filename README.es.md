@@ -13,7 +13,7 @@ Todo en **un único binario Rust** — sin Python, sin npm, sin servidores. 100%
 
 ```bash
 # 1. Instalar
-cargo install graphrag
+cargo install graphrag-search
 
 # 2. Poblar datos de demo y probar
 graphrag seed graph.db
@@ -58,7 +58,7 @@ graphrag mcp --db graph.db
 ### Desde crates.io
 
 ```bash
-cargo install graphrag
+cargo install graphrag-search
 ```
 
 ### Desde fuente
@@ -765,7 +765,7 @@ Query "Python databases"
 
 ```bash
 # 1. Install
-cargo install graphrag
+cargo install graphrag-search
 
 # 2. Populate demo data (44 nodes, ~113 edges)
 graphrag seed demo.db
@@ -840,7 +840,7 @@ graphrag reset graph.db
 ### From crates.io (recommended)
 
 ```bash
-cargo install graphrag
+cargo install graphrag-search
 ```
 
 ### From source

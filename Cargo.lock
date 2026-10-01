@@ -972,8 +972,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "graphrag"
-version = "0.2.5"
+name = "graphrag-search"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "bytemuck",
