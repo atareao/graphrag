@@ -1242,7 +1242,7 @@ fn cmd_community_detect(db: &str, resolution: f64) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            eprintln!("❌ Error detectando comunidades: {}", e);
+            eprintln!("❌ Error detectando comunidades: {:#}", e);
             Ok(())
         }
     }
@@ -1273,7 +1273,7 @@ fn cmd_community_summarize(
             Ok(())
         }
         Err(e) => {
-            eprintln!("❌ Error resumiendo comunidades: {}", e);
+            eprintln!("❌ Error resumiendo comunidades: {:#}", e);
             Ok(())
         }
     }
@@ -1361,6 +1361,11 @@ fn cmd_community_list(
         "La base de datos '{db}' no contiene una tabla 'communities'. \
          ¿Ejecutaste 'graphrag init db' y 'graphrag community detect'?"
     );
+
+    // The table exists: apply the idempotent schema migrations (v2 → v3)
+    // before listing, so the `keywords`/`topics` SELECT works on a legacy
+    // database.
+    crate::db::schema::init_db(&conn)?;
 
     let communities = select_communities(&conn, level, limit)?;
 
@@ -2044,5 +2049,70 @@ mod tests {
         assert_eq!(all.len(), 5, "limit 0 must not truncate");
         let three = select_communities(&conn, None, 3).expect("select should succeed");
         assert_eq!(three.len(), 3, "limit 3 must truncate to 3");
+    }
+
+    // ==================================================================
+    // RED — fix-community-schema-migration (community-listing delta)
+    //
+    // `cmd_community_list` MUST migrate the schema (v2 → v3) before listing,
+    // so its `keywords`/`topics` SELECT works on a legacy database.
+    // ==================================================================
+
+    /// RED-3 — `cmd_community_list` over a v2 database with communities
+    /// succeeds and leaves the database at `user_version=3`.
+    #[test]
+    fn test_cmd_community_list_migrates_v2_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("v2.db").to_string_lossy().into_owned();
+
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+
+            // A pre-existing community that must survive and be listed.
+            let c = crate::db::communities::Community {
+                id: 0,
+                label: "legacy".into(),
+                level: 1,
+                parent_id: None,
+                summary: None,
+                summary_embedding: None,
+                member_ids: vec![1, 2],
+                member_count: 2,
+                algorithm: "leiden".into(),
+                quality_fn: "cpm".into(),
+                resolution: 1.0,
+                summary_model: None,
+                embed_model: None,
+                summary_tokens: None,
+                keywords: vec![],
+                topics: vec![],
+            };
+            crate::db::communities::insert_community(&conn, &c).unwrap();
+
+            // Downgrade to the v2 shape (no keywords/topics columns).
+            conn.execute_batch(
+                "ALTER TABLE communities DROP COLUMN keywords;
+                 ALTER TABLE communities DROP COLUMN topics;
+                 PRAGMA user_version=2;",
+            )
+            .unwrap();
+        }
+
+        let uv_before: i64 = {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(uv_before, 2, "fixture must start at v2");
+
+        cmd_community_list(&db, None, 50, OutputFormat::Table)
+            .expect("community list on a v2 db must migrate and succeed");
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3, "community list must migrate the db to v3");
     }
 }

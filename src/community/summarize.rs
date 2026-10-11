@@ -12,6 +12,7 @@ use log::{info, warn};
 use rusqlite::Connection;
 
 use crate::db::communities;
+use crate::db::schema;
 use crate::embed::ollama::OllamaClient;
 use crate::vector::vector_to_blob;
 
@@ -220,6 +221,12 @@ pub fn summarize_all_communities(
     embed_model: &str,
 ) -> Result<(usize, i64)> {
     let conn = Connection::open(db_path).context("failed to open database")?;
+
+    // Apply the idempotent schema migrations before reading/updating
+    // `communities`: a legacy (v2) database lacks the `keywords`/`topics`
+    // columns and `get_all_communities` would fail with
+    // `no such column: keywords`.
+    schema::init_db(&conn).context("failed to initialise/migrate the database schema")?;
 
     // Get all communities that need summarization
     let all_communities =
@@ -693,5 +700,78 @@ mod tests {
             "summarize must persist keywords"
         );
         assert_eq!(stored.topics, vec!["web"], "summarize must persist topics");
+    }
+
+    // ==================================================================
+    // RED — fix-community-schema-migration (community-summarization delta)
+    //
+    // `summarize_all_communities` MUST migrate the schema (v2 → v3) before
+    // reading/updating `communities`, otherwise its `get_all_communities`
+    // call fails with `no such column: keywords` on a v2 database.
+    // ==================================================================
+
+    /// RED-4 — over a v2 database with an already-summarized community,
+    /// `summarize_all_communities` migrates to v3 and early-returns `(0, 0)`
+    /// without contacting Ollama.
+    #[test]
+    fn test_summarize_all_communities_migrates_v2_db() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_db(&conn).unwrap();
+
+            // A community that already carries a summary → nothing to do.
+            let emb = vector_to_blob(&[0.1_f32, 0.2_f32]);
+            let community = Community {
+                id: 0,
+                label: "already-done".into(),
+                level: 1,
+                parent_id: None,
+                summary: Some("Already summarized".into()),
+                summary_embedding: Some(emb),
+                member_ids: vec![1, 2],
+                member_count: 2,
+                algorithm: "leiden".into(),
+                quality_fn: "cpm".into(),
+                resolution: 1.0,
+                summary_model: Some("model-x".into()),
+                embed_model: Some("embed-y".into()),
+                summary_tokens: Some(42),
+                keywords: vec![],
+                topics: vec![],
+            };
+            communities::insert_community(&conn, &community).unwrap();
+
+            // Downgrade to the v2 shape (no keywords/topics columns).
+            conn.execute_batch(
+                "ALTER TABLE communities DROP COLUMN keywords;
+                 ALTER TABLE communities DROP COLUMN topics;
+                 PRAGMA user_version=2;",
+            )
+            .unwrap();
+        }
+
+        // Point at an unreachable port: the early return must not call Ollama.
+        let (count, tokens) = summarize_all_communities(
+            &db_path,
+            "http://127.0.0.1:1",
+            "llama3.2:3b",
+            "nomic-embed-text",
+        )
+        .expect("summarize on a v2 db must migrate and succeed");
+
+        assert_eq!(
+            (count, tokens),
+            (0, 0),
+            "an already-summarized community must early-return without Ollama"
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3, "summarize must leave the database at user_version 3");
     }
 }
