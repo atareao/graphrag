@@ -193,6 +193,8 @@ pub fn run_community_detection(db_path: &str, resolution: f64) -> Result<(usize,
             summary_model: None,
             embed_model: None,
             summary_tokens: None,
+            keywords: Vec::new(),
+            topics: Vec::new(),
         };
         insert_community(&conn, &community).context("failed to insert community")?;
     }
