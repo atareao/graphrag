@@ -308,6 +308,21 @@ enum CommunityCommands {
         #[arg(long, default_value = "nomic-embed-text")]
         embed_model: String,
     },
+    /// Lista las comunidades almacenadas (no requiere Ollama)
+    List {
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
+        /// Mostrar solo las comunidades de este nivel
+        #[arg(long)]
+        level: Option<i32>,
+        /// Número máximo de comunidades a mostrar (0 = sin límite, todas)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Formato de salida: table, json
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Subcommand)]
@@ -618,6 +633,15 @@ fn main() -> Result<()> {
                     &embed_model
                 };
                 cmd_community_summarize(db, ollama_url, summary_model, embed_model)
+            }
+            CommunityCommands::List {
+                db,
+                level,
+                limit,
+                format,
+            } => {
+                let db = if db == "graphrag.db" { &cfg.db } else { &db };
+                cmd_community_list(db, level, limit, format)
             }
         },
         Commands::Completions { shell } => {
@@ -1255,6 +1279,142 @@ fn cmd_community_summarize(
     }
 }
 
+/// Truncate `s` to at most `max_len` characters, appending `…` when cut.
+/// Char-based so it is safe on multibyte UTF-8.
+fn truncate_preview(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Select communities for `community list`: optionally filtered by level,
+/// ordered deterministically by `(level, id)` (the SQL queries already
+/// guarantee this order; the in-memory sort is a defensive backup), then
+/// truncated to `limit` (when `limit > 0`; `0` means "no limit").
+fn select_communities(
+    conn: &rusqlite::Connection,
+    level: Option<i32>,
+    limit: usize,
+) -> Result<Vec<crate::db::communities::Community>> {
+    let mut communities = match level {
+        Some(l) => crate::db::communities::get_communities_by_level(conn, l)?,
+        None => crate::db::communities::get_all_communities(conn)?,
+    };
+
+    communities.sort_by_key(|c| (c.level, c.id));
+
+    if limit > 0 && communities.len() > limit {
+        communities.truncate(limit);
+    }
+
+    Ok(communities)
+}
+
+/// Build the JSON array for `community list --format json`, resolving each
+/// community's member entity labels.
+fn community_list_json(
+    conn: &rusqlite::Connection,
+    communities: &[crate::db::communities::Community],
+) -> Result<String> {
+    let entries: Vec<serde_json::Value> = communities
+        .iter()
+        .map(|c| -> Result<serde_json::Value> {
+            let members = crate::db::communities::get_member_labels(conn, &c.member_ids)?;
+            Ok(serde_json::json!({
+                "id": c.id,
+                "label": c.label,
+                "level": c.level,
+                "parent_id": c.parent_id,
+                "member_count": c.member_count,
+                "keywords": c.keywords,
+                "topics": c.topics,
+                "summary": c.summary,
+                "members": members,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(serde_json::to_string_pretty(&entries)?)
+}
+
+fn cmd_community_list(
+    db: &str,
+    level: Option<i32>,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let conn = rusqlite::Connection::open(db)?;
+
+    // Guard against an uninitialized database: `Connection::open` happily
+    // creates an empty file, and querying `communities` would then fail with
+    // a raw "no such table" error.  Fail early with an actionable message.
+    let communities_table_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='communities'",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        communities_table_exists > 0,
+        "La base de datos '{db}' no contiene una tabla 'communities'. \
+         ¿Ejecutaste 'graphrag init db' y 'graphrag community detect'?"
+    );
+
+    let communities = select_communities(&conn, level, limit)?;
+
+    match format {
+        OutputFormat::Json => {
+            let json = community_list_json(&conn, &communities)?;
+            println!("{}", json);
+        }
+        _ => {
+            if communities.is_empty() {
+                println!(
+                    "No hay comunidades. Ejecuta 'graphrag community detect {}' primero.",
+                    db
+                );
+                return Ok(());
+            }
+
+            println!(
+                "{:>4}  {:>5}  {:>4}  {:<40}  miembros",
+                "id", "nivel", "n", "palabras clave"
+            );
+            println!("{}", "─".repeat(90));
+
+            for c in &communities {
+                let keywords = if c.keywords.is_empty() {
+                    c.label.clone()
+                } else {
+                    c.keywords.join(", ")
+                };
+
+                let miembros = match &c.summary {
+                    Some(summary) => truncate_preview(summary, 60),
+                    None => {
+                        let labels =
+                            crate::db::communities::get_member_labels(&conn, &c.member_ids)?;
+                        truncate_preview(&labels.join(", "), 60)
+                    }
+                };
+
+                println!(
+                    "{:>4}  {:>5}  {:>4}  {:<40}  {}",
+                    c.id,
+                    c.level,
+                    c.member_count,
+                    truncate_preview(&keywords, 40),
+                    miembros
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_graph(label: &str, db: &str, depth: i32) -> Result<()> {
     let ollama = embed::ollama::OllamaClient::new("http://localhost:11434", "nomic-embed-text");
     let hs = search::HybridSearch::new(db, ollama)?;
@@ -1659,5 +1819,230 @@ mod tests {
             res.is_ok(),
             "cmd_search --answer must succeed (generation model = summary_model): {res:?}"
         );
+    }
+
+    // ==================================================================
+    // RED — add-community-list (community-listing delta)
+    //
+    // Targets the NEW public surface:
+    //   * `CommunityCommands::List { db, level, limit, format }`
+    //   * `select_communities(conn, level, limit)`
+    //   * `community_list_json(conn, communities)`
+    // ==================================================================
+
+    #[test]
+    fn test_community_list_args_parse_all_flags() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "community",
+            "list",
+            "test.db",
+            "--level",
+            "2",
+            "--limit",
+            "5",
+            "--format",
+            "json",
+        ])
+        .expect("`community list` with flags should parse");
+
+        match cli.command {
+            Commands::Community {
+                action:
+                    CommunityCommands::List {
+                        db,
+                        level,
+                        limit,
+                        format,
+                    },
+            } => {
+                assert_eq!(db, "test.db");
+                assert_eq!(level, Some(2));
+                assert_eq!(limit, 5);
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected Commands::Community::List"),
+        }
+    }
+
+    #[test]
+    fn test_community_list_args_defaults() {
+        let cli = Cli::try_parse_from(["graphrag", "community", "list"])
+            .expect("`community list` without db should parse");
+
+        match cli.command {
+            Commands::Community {
+                action:
+                    CommunityCommands::List {
+                        db,
+                        level,
+                        limit,
+                        format,
+                    },
+            } => {
+                assert_eq!(db, "graphrag.db");
+                assert_eq!(level, None);
+                assert_eq!(limit, 50);
+                assert!(matches!(format, OutputFormat::Table));
+            }
+            _ => panic!("expected Commands::Community::List"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_community_list_select_and_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("c.db").to_string_lossy().into_owned();
+
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+
+            for (id, label) in [(1_i64, "Python"), (2, "FastAPI")] {
+                conn.execute(
+                    "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, ?3, 'entity')",
+                    rusqlite::params![id, crate::db::keys::node_key(label), label],
+                )
+                .unwrap();
+            }
+
+            for (label, level, members) in [
+                ("c_l1_a", 1, vec![1_i64, 2]),
+                ("c_l1_b", 1, vec![1_i64]),
+                ("c_l2_a", 2, vec![2_i64]),
+            ] {
+                let c = crate::db::communities::Community {
+                    id: 0,
+                    label: label.into(),
+                    level,
+                    parent_id: None,
+                    summary: None,
+                    summary_embedding: None,
+                    member_ids: members.clone(),
+                    member_count: members.len() as i32,
+                    algorithm: "leiden".into(),
+                    quality_fn: "cpm".into(),
+                    resolution: 1.0,
+                    summary_model: None,
+                    embed_model: None,
+                    summary_tokens: None,
+                    keywords: vec!["kw".into()],
+                    topics: vec!["tp".into()],
+                };
+                crate::db::communities::insert_community(&conn, &c).unwrap();
+            }
+        }
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+
+        // No level filter → all 3, ordered by (level, id).
+        let all = select_communities(&conn, None, 0).expect("select should succeed");
+        assert_eq!(all.len(), 3, "should list all 3 communities");
+        assert_eq!(all[0].level, 1, "must be ordered level-ascending");
+        assert_eq!(all[0].label, "c_l1_a", "then id-ascending");
+
+        // Level filter.
+        let l2 = select_communities(&conn, Some(2), 0).expect("select should succeed");
+        assert_eq!(l2.len(), 1, "only 1 community at level 2");
+        assert_eq!(l2[0].label, "c_l2_a");
+
+        // Limit.
+        let limited = select_communities(&conn, None, 2).expect("select should succeed");
+        assert_eq!(limited.len(), 2, "limit must truncate to 2");
+
+        // JSON output with members/keywords/topics.
+        let json = community_list_json(&conn, &l2).expect("json should succeed");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("community list JSON must be valid");
+        let arr = value.as_array().expect("must be a JSON array");
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0]["keywords"].is_array(), "keywords must be an array");
+        assert!(arr[0]["topics"].is_array(), "topics must be an array");
+        assert_eq!(
+            arr[0]["members"],
+            serde_json::json!(["FastAPI"]),
+            "members must resolve to entity labels"
+        );
+
+        // Empty list → [].
+        let empty = community_list_json(&conn, &[]).expect("empty json should succeed");
+        assert_eq!(empty.trim(), "[]", "empty list must render as []");
+    }
+
+    // T-a — `cmd_community_list` on an initialized but empty `communities`
+    // table succeeds (exit 0) in both formats (spec: "Empty communities table").
+    #[test]
+    fn test_cmd_community_list_empty_table_is_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("empty.db").to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+        }
+
+        assert!(
+            cmd_community_list(&db, None, 50, OutputFormat::Table).is_ok(),
+            "empty communities table must exit 0 (table format)"
+        );
+        assert!(
+            cmd_community_list(&db, None, 50, OutputFormat::Json).is_ok(),
+            "empty communities table must exit 0 (json format)"
+        );
+    }
+
+    // T-b — `cmd_community_list` on a database without a `communities` table
+    // returns an error (exit != 0) with an actionable message.
+    #[test]
+    fn test_cmd_community_list_missing_table_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("nodb.db").to_string_lossy().into_owned();
+
+        // The file does not exist: `Connection::open` creates it empty.
+        let err = cmd_community_list(&db, None, 50, OutputFormat::Table)
+            .expect_err("a missing communities table must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("communities") && msg.contains("init db"),
+            "error must mention the missing table and the fix, got: {msg}"
+        );
+    }
+
+    // T-d — `--limit 0` means "no limit" (must not truncate); a positive
+    // limit still truncates.
+    #[test]
+    fn test_select_communities_limit_zero_means_no_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("lim.db").to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+            for i in 0..5 {
+                let c = crate::db::communities::Community {
+                    id: 0,
+                    label: format!("c-{i}"),
+                    level: 1,
+                    parent_id: None,
+                    summary: None,
+                    summary_embedding: None,
+                    member_ids: vec![],
+                    member_count: 0,
+                    algorithm: "leiden".into(),
+                    quality_fn: "cpm".into(),
+                    resolution: 1.0,
+                    summary_model: None,
+                    embed_model: None,
+                    summary_tokens: None,
+                    keywords: vec![],
+                    topics: vec![],
+                };
+                crate::db::communities::insert_community(&conn, &c).unwrap();
+            }
+        }
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let all = select_communities(&conn, None, 0).expect("select should succeed");
+        assert_eq!(all.len(), 5, "limit 0 must not truncate");
+        let three = select_communities(&conn, None, 3).expect("select should succeed");
+        assert_eq!(three.len(), 3, "limit 3 must truncate to 3");
     }
 }

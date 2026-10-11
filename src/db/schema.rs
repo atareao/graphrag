@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS communities (
     level             INTEGER NOT NULL DEFAULT 0,
     parent_id         INTEGER REFERENCES communities(id),
     summary           TEXT,
+    keywords          TEXT,
+    topics            TEXT,
     summary_embedding BLOB,
     member_ids        TEXT    NOT NULL DEFAULT '[]',
     member_count      INTEGER NOT NULL DEFAULT 0,
@@ -224,6 +226,8 @@ CREATE TABLE IF NOT EXISTS communities (
     level             INTEGER NOT NULL DEFAULT 0,
     parent_id         INTEGER REFERENCES communities(id),
     summary           TEXT,
+    keywords          TEXT,
+    topics            TEXT,
     summary_embedding BLOB,
     member_ids        TEXT    NOT NULL DEFAULT '[]',
     member_count      INTEGER NOT NULL DEFAULT 0,
@@ -389,6 +393,33 @@ pub fn init_db(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     if user_version < 2 {
         conn.execute_batch("PRAGMA user_version=2")
             .context("failed to set schema user_version to 2")?;
+    }
+
+    // ── Schema migration v2 -> v3 ──────────────────────────────────────
+    // `keywords`/`topics` were added to `communities` in v3.  `CREATE TABLE
+    // IF NOT EXISTS` above does NOT add columns to a table that already
+    // exists, so legacy (v2) tables must be ALTERed in place.  The
+    // column-existence check makes this idempotent.
+    let communities_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='communities'",
+        [],
+        |r| r.get(0),
+    )?;
+
+    if communities_exists > 0 && !column_exists(conn, "communities", "keywords")? {
+        conn.execute_batch(
+            "ALTER TABLE communities ADD COLUMN keywords TEXT;
+             ALTER TABLE communities ADD COLUMN topics TEXT;",
+        )
+        .context("failed to add keywords/topics columns (schema v3)")?;
+    }
+
+    // A fresh database (created by the DDL above) already carries the
+    // columns; a migrated one just gained them.  Either way the schema is
+    // now v3.
+    if user_version < 3 {
+        conn.execute_batch("PRAGMA user_version=3")
+            .context("failed to set schema user_version to 3")?;
     }
 
     Ok(())
@@ -740,7 +771,21 @@ CREATE TABLE chunks (
         let uv: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2, "user_version must be 2 after migration");
+        // `init_db` migrates all the way to the latest schema (v3): the
+        // v1→v2 rebuild is followed by the v2→v3 column additions.
+        assert_eq!(uv, 3, "user_version must be 3 after migration");
+
+        // The v1→v3 path must also leave `communities` with the v3 columns,
+        // even though the legacy schema had no `communities` table at all
+        // (it is created by the DDL and must carry keywords/topics).
+        assert!(
+            column_exists(&conn, "communities", "keywords").unwrap(),
+            "v1→v3 must yield a communities table with keywords"
+        );
+        assert!(
+            column_exists(&conn, "communities", "topics").unwrap(),
+            "v1→v3 must yield a communities table with topics"
+        );
     }
 
     /// Running `init_db` twice must not re-key or fail.
@@ -767,6 +812,175 @@ CREATE TABLE chunks (
         let uv: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3, "user_version must remain 3");
+    }
+
+    // ── add-community-list v2→v3 tests (RED) ──────────────────────────
+
+    /// DDL approximating the v2 schema: `nodes` already carries the `key`
+    /// column (so the v1→v2 rebuild is skipped) and `communities` lacks the
+    /// v3 `keywords`/`topics` columns.  `user_version` is pinned to 2.
+    const V2_SCHEMA: &str = r#"
+PRAGMA user_version=2;
+CREATE TABLE nodes (
+    id          INTEGER PRIMARY KEY,
+    key         TEXT    NOT NULL,
+    label       TEXT    NOT NULL,
+    type        TEXT    NOT NULL,
+    embedding   BLOB,
+    metadata    TEXT,
+    created_at  TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX idx_nodes_key ON nodes(key);
+CREATE TABLE edges (
+    id          INTEGER PRIMARY KEY,
+    source_id   INTEGER NOT NULL,
+    target_id   INTEGER NOT NULL,
+    type        TEXT    NOT NULL,
+    weight      REAL    DEFAULT 1.0,
+    context     TEXT
+);
+CREATE TABLE chunks (
+    id          INTEGER PRIMARY KEY,
+    note_id     INTEGER NOT NULL REFERENCES nodes(id),
+    header      TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    embedding   BLOB,
+    metadata    TEXT
+);
+CREATE TABLE communities (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    label             TEXT    NOT NULL,
+    level             INTEGER NOT NULL DEFAULT 0,
+    parent_id         INTEGER REFERENCES communities(id),
+    summary           TEXT,
+    summary_embedding BLOB,
+    member_ids        TEXT    NOT NULL DEFAULT '[]',
+    member_count      INTEGER NOT NULL DEFAULT 0,
+    algorithm         TEXT    NOT NULL DEFAULT 'leiden',
+    quality_fn        TEXT    NOT NULL DEFAULT 'cpm',
+    resolution        REAL    NOT NULL DEFAULT 1.0,
+    summary_model     TEXT,
+    embed_model       TEXT,
+    summary_tokens    INTEGER,
+    created_at        TEXT    DEFAULT (datetime('now'))
+);
+"#;
+
+    /// Count how many columns named `column` a table has (to detect a
+    /// duplicated column after a double migration).
+    fn column_count(conn: &rusqlite::Connection, table: &str, column: &str) -> i64 {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut count = 0;
+        while let Some(row) = rows.next().unwrap() {
+            let name: String = row.get(1).unwrap();
+            if name == column {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// RED-1 — a legacy v2 database is migrated to v3: the `keywords` and
+    /// `topics` columns are added, pre-existing rows survive with NULL
+    /// values, and `user_version` becomes 3.
+    #[test]
+    fn test_migrate_v2_to_v3_adds_columns() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(V2_SCHEMA).unwrap();
+
+        // A pre-existing community that must survive the migration.
+        conn.execute(
+            "INSERT INTO communities (label, level, member_ids, member_count) \
+             VALUES ('c-1', 1, '[1,2]', 2)",
+            [],
+        )
+        .unwrap();
+
+        let before: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 2, "fixture must start at user_version 2");
+
+        init_db(&conn).unwrap();
+
+        assert!(
+            column_exists(&conn, "communities", "keywords").unwrap(),
+            "keywords column must exist after migration"
+        );
+        assert!(
+            column_exists(&conn, "communities", "topics").unwrap(),
+            "topics column must exist after migration"
+        );
+
+        // Pre-existing row survives with NULL keywords/topics.
+        let label: String = conn
+            .query_row("SELECT label FROM communities WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(label, "c-1", "pre-existing community must survive");
+        let kw: Option<String> = conn
+            .query_row("SELECT keywords FROM communities WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let tp: Option<String> = conn
+            .query_row("SELECT topics FROM communities WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(kw.is_none(), "migrated row must have NULL keywords");
+        assert!(tp.is_none(), "migrated row must have NULL topics");
+
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3, "user_version must be 3 after migration");
+    }
+
+    /// RED-2 — migration is idempotent and a fresh database is born at v3
+    /// with both columns present (and not duplicated).
+    #[test]
+    fn test_migrate_v3_fresh_and_idempotent() {
+        // Fresh database.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        assert!(
+            column_exists(&conn, "communities", "keywords").unwrap(),
+            "fresh database must have keywords column"
+        );
+        assert!(
+            column_exists(&conn, "communities", "topics").unwrap(),
+            "fresh database must have topics column"
+        );
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3, "fresh database must be at user_version 3");
+
+        // Re-running init_db must not fail, must keep version 3 and must
+        // not duplicate the columns.
+        init_db(&conn).unwrap();
+
+        let uv2: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv2, 3, "user_version must remain 3");
+        assert_eq!(
+            column_count(&conn, "communities", "keywords"),
+            1,
+            "keywords column must not be duplicated"
+        );
+        assert_eq!(
+            column_count(&conn, "communities", "topics"),
+            1,
+            "topics column must not be duplicated"
+        );
     }
 }

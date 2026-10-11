@@ -275,6 +275,8 @@ pub fn summarize_all_communities(
                     summary_model,
                     embed_model,
                     result.tokens,
+                    &result.keywords,
+                    &result.topics,
                 )
                 .context("failed to update community summary")?;
 
@@ -638,6 +640,8 @@ mod tests {
                 summary_model: Some("model-x".into()),
                 embed_model: Some("embed-y".into()),
                 summary_tokens: Some(42),
+                keywords: vec![],
+                topics: vec![],
             };
             communities::insert_community(&conn, &community).unwrap();
         }
@@ -651,5 +655,43 @@ mod tests {
         .expect("summarize with all already done should succeed");
         assert_eq!(count, 0, "should return 0 summaries");
         assert_eq!(tokens, 0, "should return 0 tokens");
+    }
+
+    // ------------------------------------------------------------------
+    // RED-5 — the summarize pipeline persists keywords/topics
+    //
+    // `summarize_all_communities` persists the LLM's `keywords`/`topics`
+    // via `communities::update_community_summary`; today the helper drops
+    // them.  This pins that the persistence helper accepts and stores both.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_summarize_persistence_passes_keywords_topics() {
+        let conn = setup_db();
+        let id = insert_community(&conn, "kw-community", 1, vec![1, 2]);
+
+        let emb = vector_to_blob(&[0.1_f32, 0.2_f32]);
+        communities::update_community_summary(
+            &conn,
+            id,
+            "Resumen de la comunidad",
+            &emb,
+            "llama3.2:3b",
+            "nomic-embed-text",
+            5,
+            &["python".to_string(), "fastapi".to_string()],
+            &["web".to_string()],
+        )
+        .expect("update should succeed");
+
+        let stored = communities::get_community_by_id(&conn, id)
+            .expect("get should succeed")
+            .expect("community should exist");
+        assert_eq!(
+            stored.keywords,
+            vec!["python", "fastapi"],
+            "summarize must persist keywords"
+        );
+        assert_eq!(stored.topics, vec!["web"], "summarize must persist topics");
     }
 }
