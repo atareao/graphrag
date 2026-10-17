@@ -98,6 +98,9 @@ enum Commands {
         /// Formato de salida: table, list, json
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+        /// Ocultar el contenido (preview del chunk) en la salida de tabla
+        #[arg(long)]
+        no_content: bool,
     },
     /// Búsqueda híbrida (vectores + grafos)
     Search {
@@ -138,6 +141,9 @@ enum Commands {
         /// Formato de salida: table, list, json
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+        /// Ocultar el contenido (preview del chunk) en la salida de tabla
+        #[arg(long)]
+        no_content: bool,
     },
     /// Responde una pregunta en lenguaje natural (RAG: retrieval híbrido + generación con Ollama)
     Ask {
@@ -221,6 +227,9 @@ enum Commands {
         /// Formato de salida: table, list, json
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+        /// Ocultar el contenido (preview del chunk) en la salida de tabla
+        #[arg(long)]
+        no_content: bool,
     },
     /// Camino más corto entre dos nodos
     Path {
@@ -412,6 +421,7 @@ fn main() -> Result<()> {
             filter,
             answer,
             format,
+            no_content,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let k = if k == 5 { cfg.k } else { k };
@@ -450,6 +460,7 @@ fn main() -> Result<()> {
                 &filter,
                 answer,
                 &format,
+                no_content,
             )
         }
         Commands::Ask {
@@ -513,6 +524,7 @@ fn main() -> Result<()> {
             notes_only,
             filter,
             format,
+            no_content,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let k = if k == 5 { cfg.k } else { k };
@@ -520,6 +532,7 @@ fn main() -> Result<()> {
             debug!("Comando: similar label={:?}, file={:?}", label, file);
             cmd_similar(
                 label, file, db, k, depth, min_weight, notes_only, &filter, &cfg, &format,
+                no_content,
             )
         }
         Commands::Graph { label, db, depth } => {
@@ -540,13 +553,14 @@ fn main() -> Result<()> {
             limit,
             notes_only,
             format,
+            no_content,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             debug!(
                 "Comando: fts query='{}', limit={}, notes_only={}",
                 query, limit, notes_only
             );
-            cmd_fts(&query, db, limit, notes_only, &format)
+            cmd_fts(&query, db, limit, notes_only, &format, no_content)
         }
         Commands::Path {
             from,
@@ -901,6 +915,7 @@ fn cmd_search(
     filter: &[String],
     answer: bool,
     format: &OutputFormat,
+    no_content: bool,
 ) -> Result<()> {
     // Parse filters (fail early on invalid syntax)
     let filters: Vec<search::filter::Filter> = filter
@@ -940,7 +955,7 @@ fn cmd_search(
         hs.hybrid_search(query, k, depth, alpha, min_weight, notes_only, &filters)?
     };
 
-    display_results(&results, format);
+    display_results(&results, format, no_content);
 
     // ── Mostrar comunidades relacionadas ──
     {
@@ -1061,7 +1076,7 @@ fn cmd_ask(
                     );
                 } else {
                     println!("\n🧠 RESULTADOS DE RETRIEVAL\n{}", "─".repeat(50));
-                    display_results(&[], format);
+                    display_results(&[], format, false);
                 }
                 return Ok(());
             }
@@ -1122,7 +1137,7 @@ fn cmd_ask(
                 );
             } else {
                 println!("\n🧠 RESULTADOS DE RETRIEVAL\n{}", "─".repeat(50));
-                display_results(&results, format);
+                display_results(&results, format, false);
             }
             eprintln!("⚠️  answer generation skipped; is Ollama running?");
         }
@@ -1169,6 +1184,7 @@ fn cmd_similar(
     filter: &[String],
     cfg: &config::GraphRagConfig,
     format: &OutputFormat,
+    no_content: bool,
 ) -> Result<()> {
     // Validar que exactamente uno de --label o --file esté presente
     match (&label, &file) {
@@ -1207,7 +1223,7 @@ fn cmd_similar(
         }
 
         let results = hs.similar_by_label(lbl, k, depth, min_weight, notes_only, &filters)?;
-        display_results(&results, format);
+        display_results(&results, format, no_content);
     } else if let Some(f) = &file {
         if !matches!(format, OutputFormat::Json) {
             println!("\n🔍 Similares a archivo: '{}'", f);
@@ -1219,7 +1235,7 @@ fn cmd_similar(
         }
 
         let results = hs.similar_by_file(f, k, depth, min_weight, notes_only, &filters)?;
-        display_results(&results, format);
+        display_results(&results, format, no_content);
     }
 
     Ok(())
@@ -1453,6 +1469,7 @@ fn cmd_fts(
     limit: usize,
     notes_only: bool,
     format: &OutputFormat,
+    no_content: bool,
 ) -> Result<()> {
     let ollama = embed::ollama::OllamaClient::new("http://localhost:11434", "nomic-embed-text");
     let hs = search::HybridSearch::new(db, ollama)?;
@@ -1467,7 +1484,7 @@ fn cmd_fts(
 
     let results = hs.fts_search(query, limit, notes_only)?;
 
-    display_results(&results, format);
+    display_results(&results, format, no_content);
 
     Ok(())
 }
@@ -1520,13 +1537,22 @@ fn cmd_stats(db: &str) -> Result<()> {
     Ok(())
 }
 
-/// Formats search results based on OutputFormat and prints to stdout
-fn display_results(results: &[crate::search::SearchResult], format: &OutputFormat) {
+/// Renders search results into `out`, honoring the output format and the
+/// `--no-content` flag (which suppresses the per-result `└──` chunk preview).
+///
+/// Kept separate from [`display_results`] so it can write into any sink
+/// (e.g. a `Vec<u8>` in tests) instead of being hard-wired to stdout.
+fn render_results(
+    results: &[crate::search::SearchResult],
+    format: &OutputFormat,
+    no_content: bool,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     match format {
         OutputFormat::Table => {
             if results.is_empty() {
-                println!("   (sin resultados)");
-                return;
+                writeln!(out, "   (sin resultados)")?;
+                return Ok(());
             }
             for r in results {
                 let file_info = if !r.file.is_empty() {
@@ -1535,11 +1561,12 @@ fn display_results(results: &[crate::search::SearchResult], format: &OutputForma
                     String::new()
                 };
                 let n_count = r.neighbors.len();
-                println!(
+                writeln!(
+                    out,
                     "   {:>10.3}  [{:8}] {}{}  (vecinos: {})",
                     r.score, r.r#type, r.label, file_info, n_count
-                );
-                if !r.chunk_header.is_empty() {
+                )?;
+                if !no_content && !r.chunk_header.is_empty() {
                     // Truncate content for display, same as clip_text in hybrid.rs
                     let preview = if r.content.len() > 200 {
                         let cutoff = r
@@ -1552,16 +1579,16 @@ fn display_results(results: &[crate::search::SearchResult], format: &OutputForma
                     } else {
                         r.content.clone()
                     };
-                    println!("   └── {}: {}", r.chunk_header, preview);
+                    writeln!(out, "   └── {}: {}", r.chunk_header, preview)?;
                 }
             }
             // Show neighbors of first result
             if let Some(first) = results.first() {
                 if !first.neighbors.is_empty() {
-                    println!("\n🔗 Vecinos de '{}':", first.label);
-                    println!("{}", "─".repeat(50));
+                    writeln!(out, "\n🔗 Vecinos de '{}':", first.label)?;
+                    writeln!(out, "{}", "─".repeat(50))?;
                     for n in &first.neighbors {
-                        println!("   [dist {}] {} ({})", n.distance, n.label, n.r#type);
+                        writeln!(out, "   [dist {}] {} ({})", n.distance, n.label, n.r#type)?;
                     }
                 }
             }
@@ -1569,15 +1596,30 @@ fn display_results(results: &[crate::search::SearchResult], format: &OutputForma
         OutputFormat::List => {
             for r in results {
                 if r.r#type == "note" && !r.file.is_empty() {
-                    println!("- [{}]({})", r.label, r.file);
+                    writeln!(out, "- [{}]({})", r.label, r.file)?;
                 }
             }
         }
         OutputFormat::Json => match serde_json::to_string_pretty(results) {
-            Ok(json) => println!("{}", json),
+            Ok(json) => writeln!(out, "{}", json)?,
             Err(e) => eprintln!("❌ Error serializando resultados: {}", e),
         },
     }
+    Ok(())
+}
+
+/// Formats search results based on OutputFormat and prints to stdout.
+///
+/// When `no_content` is true, the per-result chunk preview (`└── ...`) is
+/// suppressed in table output.
+fn display_results(
+    results: &[crate::search::SearchResult],
+    format: &OutputFormat,
+    no_content: bool,
+) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = render_results(results, format, no_content, &mut lock);
 }
 
 #[cfg(test)]
@@ -1589,7 +1631,7 @@ mod tests {
     fn test_display_table_empty() {
         let results: Vec<SearchResult> = vec![];
         // Just verify it doesn't panic
-        display_results(&results, &OutputFormat::Table);
+        display_results(&results, &OutputFormat::Table, false);
     }
 
     #[test]
@@ -1620,9 +1662,9 @@ mod tests {
         ];
         // Since we can't easily capture stdout in a simple test,
         // this test verifies no panic and correct filtering logic by checking the function runs
-        display_results(&results, &OutputFormat::List);
+        display_results(&results, &OutputFormat::List, false);
         // Also test JSON mode
-        display_results(&results, &OutputFormat::Json);
+        display_results(&results, &OutputFormat::Json, false);
     }
 
     #[test]
@@ -1638,14 +1680,14 @@ mod tests {
             chunk_header: "".into(),
             chunk_text: "".into(),
         }];
-        display_results(&results, &OutputFormat::List);
+        display_results(&results, &OutputFormat::List, false);
         // In list mode, entities should produce no output (no assertion needed, just no panic)
     }
 
     #[test]
     fn test_display_json_empty() {
         let results: Vec<SearchResult> = vec![];
-        display_results(&results, &OutputFormat::Json);
+        display_results(&results, &OutputFormat::Json, false);
         // Should print "[]" without panic
     }
 
@@ -1818,6 +1860,7 @@ mod tests {
             &[],
             true,
             &OutputFormat::List,
+            false,
         );
 
         assert!(
@@ -2114,5 +2157,221 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(uv, 3, "community list must migrate the db to v3");
+    }
+
+    // ==================================================================
+    // RED — add-search-no-content (output-format + similar-command deltas)
+    //
+    // Targets the NEW public surface in this binary and therefore does
+    // not compile until the GREEN phase lands:
+    //   * `render_results(results, format, no_content, out) -> io::Result<()>`
+    //   * `Commands::{Search,Similar,Fts} { no_content, .. }`
+    // ==================================================================
+
+    fn render_to_string(
+        results: &[SearchResult],
+        format: &OutputFormat,
+        no_content: bool,
+    ) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        render_results(results, format, no_content, &mut buf).expect("render debe funcionar");
+        String::from_utf8(buf).expect("utf-8")
+    }
+
+    /// A single `note` result whose chunk carries a header (so the preview
+    /// block renders by default) and whose neighbor list is non-empty.
+    fn no_content_sample_result() -> SearchResult {
+        use crate::graph::expand::Neighbor;
+        SearchResult {
+            id: 1,
+            label: "search-hybrida".into(),
+            r#type: "note".into(),
+            score: 0.917,
+            content:
+                "## La consulta base: ```bash\ngraphrag search \"servidor web seguro\" grafo.db -k 5\n```"
+                    .into(),
+            file: "Podcasts/guiones/0841/ejemplos-0841/search-hybrida.md".into(),
+            neighbors: vec![Neighbor {
+                id: 2,
+                label: "Docker".into(),
+                r#type: "entity".into(),
+                distance: 1,
+            }],
+            chunk_header: "Introduction".into(),
+            chunk_text: "graphrag search \"servidor web seguro\" grafo.db -k 5".into(),
+        }
+    }
+
+    // RED-1 — `--no-content` omits the preview but keeps the score line.
+    #[test]
+    fn test_render_results_no_content_omits_preview() {
+        let results = vec![no_content_sample_result()];
+        let text = render_to_string(&results, &OutputFormat::Table, true);
+
+        assert!(
+            text.contains("search-hybrida"),
+            "label must remain:\n{text}"
+        );
+        assert!(text.contains("0.917"), "score must remain:\n{text}");
+        assert!(
+            text.contains("search-hybrida.md"),
+            "file must remain:\n{text}"
+        );
+        assert!(
+            text.contains("(vecinos: 1)"),
+            "neighbor count must remain:\n{text}"
+        );
+        assert!(!text.contains("└──"), "preview must be omitted:\n{text}");
+    }
+
+    // RED-2 — regression guard: default output keeps the preview.
+    #[test]
+    fn test_render_results_default_keeps_preview() {
+        let results = vec![no_content_sample_result()];
+        let text = render_to_string(&results, &OutputFormat::Table, false);
+
+        assert!(
+            text.contains("└── Introduction:"),
+            "default output must keep the preview:\n{text}"
+        );
+        assert!(
+            text.contains("servidor web seguro"),
+            "default preview must keep the chunk text:\n{text}"
+        );
+    }
+
+    // RED-3 — the neighbor block of the first result survives `--no-content`.
+    #[test]
+    fn test_render_results_no_content_keeps_neighbors() {
+        let results = vec![no_content_sample_result()];
+        let text = render_to_string(&results, &OutputFormat::Table, true);
+
+        assert!(
+            text.contains("🔗 Vecinos de 'search-hybrida'"),
+            "neighbor block header must remain:\n{text}"
+        );
+        assert!(
+            text.contains("Docker"),
+            "neighbor label must remain:\n{text}"
+        );
+    }
+
+    // RED-4a — `--no-content` is a no-op in list format.
+    #[test]
+    fn test_render_results_no_content_is_noop_for_list() {
+        let results = vec![no_content_sample_result()];
+        let with = render_to_string(&results, &OutputFormat::List, true);
+        let without = render_to_string(&results, &OutputFormat::List, false);
+        assert_eq!(with, without, "--no-content must be a no-op in list format");
+    }
+
+    // RED-4b — `--no-content` is a no-op in json format.
+    #[test]
+    fn test_render_results_no_content_is_noop_for_json() {
+        let results = vec![no_content_sample_result()];
+        let with = render_to_string(&results, &OutputFormat::Json, true);
+        let without = render_to_string(&results, &OutputFormat::Json, false);
+        assert_eq!(with, without, "--no-content must be a no-op in json format");
+    }
+
+    // RED-6 — an empty table plus `--no-content` hits the early return and
+    // yields exactly the "no results" line.
+    #[test]
+    fn test_render_results_empty_table_with_no_content() {
+        let results: Vec<SearchResult> = vec![];
+        let text = render_to_string(&results, &OutputFormat::Table, true);
+
+        assert_eq!(text, "   (sin resultados)\n");
+        assert!(
+            !text.contains("└──"),
+            "no preview on empty results:\n{text}"
+        );
+    }
+
+    // RED-7 — a content longer than 200 chars is truncated to 200 chars plus
+    // an ellipsis, and `--no-content` still drops the whole preview.
+    #[test]
+    fn test_render_results_truncates_long_preview() {
+        let mut result = no_content_sample_result();
+        result.content = "a".repeat(250);
+
+        let kept = render_to_string(std::slice::from_ref(&result), &OutputFormat::Table, false);
+        assert!(
+            kept.contains(&format!("└── Introduction: {}...", "a".repeat(200))),
+            "preview must truncate to 200 chars + ellipsis:\n{kept}"
+        );
+
+        let hidden = render_to_string(std::slice::from_ref(&result), &OutputFormat::Table, true);
+        assert!(
+            !hidden.contains("└──"),
+            "preview must be omitted:\n{hidden}"
+        );
+    }
+
+    // RED-5a — `search` accepts `--no-content`.
+    #[test]
+    fn test_search_args_parse_no_content() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "search",
+            "servidor web seguro",
+            "test.db",
+            "--no-content",
+        ])
+        .expect("search --no-content should parse");
+        match cli.command {
+            Commands::Search { no_content, .. } => assert!(no_content, "--no-content sets true"),
+            _ => panic!("expected Commands::Search"),
+        }
+
+        let cli = Cli::try_parse_from(["graphrag", "search", "servidor web seguro", "test.db"])
+            .expect("search without --no-content should parse");
+        match cli.command {
+            Commands::Search { no_content, .. } => assert!(!no_content, "default must be false"),
+            _ => panic!("expected Commands::Search"),
+        }
+    }
+
+    // RED-5b — `similar` accepts `--no-content`.
+    #[test]
+    fn test_similar_args_parse_no_content() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "similar",
+            "--label",
+            "Python",
+            "test.db",
+            "--no-content",
+        ])
+        .expect("similar --no-content should parse");
+        match cli.command {
+            Commands::Similar { no_content, .. } => assert!(no_content, "--no-content sets true"),
+            _ => panic!("expected Commands::Similar"),
+        }
+
+        let cli = Cli::try_parse_from(["graphrag", "similar", "--label", "Python", "test.db"])
+            .expect("similar without --no-content should parse");
+        match cli.command {
+            Commands::Similar { no_content, .. } => assert!(!no_content, "default must be false"),
+            _ => panic!("expected Commands::Similar"),
+        }
+    }
+
+    // RED-5c — `fts` accepts `--no-content`.
+    #[test]
+    fn test_fts_args_parse_no_content() {
+        let cli = Cli::try_parse_from(["graphrag", "fts", "Docker", "test.db", "--no-content"])
+            .expect("fts --no-content should parse");
+        match cli.command {
+            Commands::Fts { no_content, .. } => assert!(no_content, "--no-content sets true"),
+            _ => panic!("expected Commands::Fts"),
+        }
+
+        let cli = Cli::try_parse_from(["graphrag", "fts", "Docker", "test.db"])
+            .expect("fts without --no-content should parse");
+        match cli.command {
+            Commands::Fts { no_content, .. } => assert!(!no_content, "default must be false"),
+            _ => panic!("expected Commands::Fts"),
+        }
     }
 }

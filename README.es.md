@@ -235,6 +235,7 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--answer` | — | Respuesta narrativa con contexto de comunidades |
 | `--min-weight` | — | Peso mínimo de arista para expansión |
 | `--format` | `table` | Formato de salida: `table`, `list` o `json` |
+| `--no-content` | — | Omitir el contenido (preview del chunk) en la salida de tabla |
 | `--ollama-url` | `http://localhost:11434` | URL del servidor Ollama |
 | `--embed-model` | `nomic-embed-text` | Modelo de embeddings |
 
@@ -291,6 +292,7 @@ $ graphrag similar --file ~/borradores/nueva-idea.md graph.db -k 10 -d 2
 | `--min-weight` | — | Peso mínimo de arista para expansión |
 | `--filter` | — | Filtrar por campo de metadatos (`--filter "category = tutorial"`) |
 | `--format` | `table` | Formato de salida: `table`, `list` o `json` |
+| `--no-content` | — | Omitir el contenido (preview del chunk) en la salida de tabla |
 
 Nota: `--label` y `--file` son mutuamente excluyentes. Usa exactamente uno.
 
@@ -307,6 +309,7 @@ graphrag fts "Python" graph.db -l 20
 | `-l` | 10 | Número de resultados |
 | `--notes-only` | — | Mostrar solo notas (sin entidades/tags) |
 | `--format` | `table` | Formato de salida: `table`, `list` o `json` |
+| `--no-content` | — | Omitir el contenido (preview del chunk) en la salida de tabla |
 
 ### `graphrag graph <ETIQUETA> [DB]`
 

@@ -46,12 +46,17 @@ Given a label of an indexed note or an external file, finds semantically similar
 
 ### Requirement: Similar command uses same output format as search
 
-Results from `graphrag similar` SHALL use the same `SearchResult` structure as `graphrag search`. The output format SHALL be controlled by the `--format` flag, which accepts `table`, `list`, or `json` (default: `table`). `table` mode displays score, type, label, file path, chunk header, chunk text preview, and neighbor list. `list` mode renders markdown bullet links for notes. `json` mode serializes results as JSON.
+Results from `graphrag similar` SHALL use the same `SearchResult` structure as `graphrag search`. The output format SHALL be controlled by the `--format` flag, which accepts `table`, `list`, or `json` (default: `table`). `table` mode displays score, type, label, file path, chunk header, chunk text preview, and neighbor list; when the `--no-content` flag is passed, the chunk header and chunk text preview SHALL be omitted and every other element of the table SHALL be preserved. `list` mode renders markdown bullet links for notes. `json` mode serializes results as JSON.
 
 #### Scenario: Output format matches search
 - **WHEN** `graphrag similar --label "Python" graph.db` returns results
 - **THEN** each result SHALL include: score, label, type, file, chunk_header, chunk_text, and neighbors
 - **AND** the display format SHALL match that of `graphrag search`
+
+#### Scenario: Preview suppressed on request
+- **WHEN** user runs `graphrag similar --label "Python" graph.db --no-content`
+- **THEN** no `└──` preview line SHALL be printed
+- **AND** the `score  [type]  label  (file)  (vecinos: N)` lines and the neighbor list SHALL be unchanged
 
 #### Scenario: List format produces markdown links
 - **WHEN** user runs `graphrag similar --label "Python" graph.db --format list`

@@ -649,6 +649,7 @@ graphrag search "Python and databases" graph.db -k 10 -d 2
 | `--filter` | — | Filter by metadata (repeatable). Format: `'field op value'` e.g. `--filter 'date >= 2023'` |
 | `--answer` | — | Narrative answer using community context (requires `community detect + summarize`) |
 | `--format` | `table` | Output format: `table`, `list`, or `json` |
+| `--no-content` | — | Omit the chunk content preview in table output |
 
 ---
 
@@ -705,6 +706,7 @@ $ graphrag similar --file ~/drafts/new-idea.md graph.db -k 10 -d 2
 | `--min-weight` | — | Minimum edge weight for expansion |
 | `--filter` | — | Filter by metadata field (`--filter "category = tutorial"`) |
 | `--format` | `table` | Output format: `table`, `list`, or `json` |
+| `--no-content` | — | Omit the chunk content preview in table output |
 
 Note: `--label` and `--file` are mutually exclusive. Use exactly one.
 
@@ -721,6 +723,7 @@ graphrag fts "Python" graph.db -l 20
 | `-l` | 10 | Number of results |
 | `--notes-only` | — | Show only notes (no entities/tags) |
 | `--format` | `table` | Output format: `table`, `list`, or `json` |
+| `--no-content` | — | Omit the chunk content preview in table output |
 
 ---
 
