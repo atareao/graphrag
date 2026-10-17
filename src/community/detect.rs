@@ -13,6 +13,7 @@ use leiden_rs::leiden::{Leiden, LeidenConfigBuilder, QualityType};
 use rusqlite::Connection;
 
 use crate::db::communities::{delete_all_communities, insert_community, Community};
+use crate::db::schema;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -171,13 +172,44 @@ pub fn detect_communities(
 pub fn run_community_detection(db_path: &str, resolution: f64) -> Result<(usize, usize)> {
     let conn = Connection::open(db_path).context("failed to open database")?;
 
+    // Apply the idempotent schema migrations before touching `communities`.
+    // The `community` commands open the database directly with
+    // `Connection::open` (not through `init_db`), so a legacy database
+    // (`user_version=2`, without the v3 `keywords`/`topics` columns) would
+    // otherwise fail with `no such column: keywords`.
+    schema::init_db(&conn).context("failed to initialise/migrate the database schema")?;
+
     // Load, detect, and store.
     let communities = detect_communities(&conn, resolution)?;
 
-    // Clear existing communities and insert new ones.
-    delete_all_communities(&conn).context("failed to clear existing communities")?;
+    // Replace the previous communities atomically: a failure while inserting
+    // the new set rolls back the deletion, so the table is never left empty.
+    replace_communities(&conn, &communities, resolution)?;
 
-    for (level, member_ids, label) in &communities {
+    let num_level1 = communities.iter().filter(|(l, _, _)| *l == 1).count();
+    let num_level2 = communities.iter().filter(|(l, _, _)| *l == 2).count();
+
+    Ok((num_level1, num_level2))
+}
+
+/// Atomically replace every stored community with `communities`.
+///
+/// The previous rows are deleted and the new ones inserted inside a single
+/// transaction: if any insertion fails, the whole operation is rolled back
+/// and the existing communities are preserved (the table never ends up empty
+/// because of a mid-operation failure).
+fn replace_communities(
+    conn: &Connection,
+    communities: &[(i32, Vec<i64>, String)],
+    resolution: f64,
+) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("failed to start communities transaction")?;
+
+    delete_all_communities(&tx).context("failed to clear existing communities")?;
+
+    for (level, member_ids, label) in communities {
         let community = Community {
             id: 0, // auto-assigned by SQLite
             label: label.clone(),
@@ -193,14 +225,16 @@ pub fn run_community_detection(db_path: &str, resolution: f64) -> Result<(usize,
             summary_model: None,
             embed_model: None,
             summary_tokens: None,
+            keywords: Vec::new(),
+            topics: Vec::new(),
         };
-        insert_community(&conn, &community).context("failed to insert community")?;
+        insert_community(&tx, &community).context("failed to insert community")?;
     }
 
-    let num_level1 = communities.iter().filter(|(l, _, _)| *l == 1).count();
-    let num_level2 = communities.iter().filter(|(l, _, _)| *l == 2).count();
+    tx.commit()
+        .context("failed to commit communities transaction")?;
 
-    Ok((num_level1, num_level2))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +275,42 @@ mod tests {
             rusqlite::params![src, dst, weight],
         )
         .unwrap();
+    }
+
+    /// Downgrade an initialised database to `user_version=2` by stripping the
+    /// v3 `keywords`/`topics` columns from `communities` (fixture for the
+    /// regression: the `community` commands used to open the DB without
+    /// running `init_db`, so a v2 database failed with
+    /// `no such column: keywords`).
+    fn downgrade_to_v2(conn: &Connection) {
+        conn.execute_batch(
+            "ALTER TABLE communities DROP COLUMN keywords;
+             ALTER TABLE communities DROP COLUMN topics;
+             PRAGMA user_version=2;",
+        )
+        .expect("v2 downgrade fixture should apply");
+    }
+
+    /// Read the current `PRAGMA user_version`.
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Populate a 6-entity, 2-cluster graph (deterministic clusters for
+    /// Leiden) in the given connection.
+    fn insert_two_clusters(conn: &Connection) {
+        for i in 1..=6 {
+            insert_node(conn, i, &format!("entity_{i}"), "language");
+        }
+        insert_edge(conn, 1, 2, 0.9);
+        insert_edge(conn, 1, 3, 0.8);
+        insert_edge(conn, 2, 3, 0.7);
+        insert_edge(conn, 4, 5, 0.9);
+        insert_edge(conn, 4, 6, 0.8);
+        insert_edge(conn, 5, 6, 0.7);
+        insert_edge(conn, 3, 4, 0.1);
+        insert_edge(conn, 2, 5, 0.05);
     }
 
     // ------------------------------------------------------------------
@@ -387,5 +457,106 @@ mod tests {
                 community.label
             );
         }
+    }
+
+    // ==================================================================
+    // RED — fix-community-schema-migration (community-detection delta)
+    //
+    // `run_community_detection` MUST migrate the schema (v2 → v3) before
+    // touching `communities`, and MUST replace communities atomically.
+    // ==================================================================
+
+    /// RED-1 — `run_community_detection` over a v2 database migrates the
+    /// schema to v3 and inserts the detected communities without the
+    /// `no such column: keywords` error.
+    #[test]
+    fn test_run_community_detection_migrates_v2_db() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_db(&conn).unwrap();
+            insert_two_clusters(&conn);
+            downgrade_to_v2(&conn);
+            assert_eq!(user_version(&conn), 2, "fixture must start at v2");
+        }
+
+        let result = run_community_detection(&db_path, 0.5);
+        assert!(
+            result.is_ok(),
+            "detect on a v2 db must migrate and succeed, got: {result:?}"
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            3,
+            "detect must leave the database at user_version 3"
+        );
+
+        let stored = crate::db::communities::get_all_communities(&conn).unwrap();
+        assert!(
+            !stored.is_empty(),
+            "communities must be inserted after the migration"
+        );
+    }
+
+    /// RED-2 — the replacement of communities is atomic: if an insertion
+    /// fails, the previously stored communities survive (the table is never
+    /// left empty by a mid-operation failure).
+    #[test]
+    fn test_run_community_detection_atomic_on_insert_failure() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_db(&conn).unwrap();
+            insert_two_clusters(&conn);
+
+            // A pre-existing community that must never be lost.
+            let pre_existing = Community {
+                id: 0,
+                label: "pre-existing".into(),
+                level: 1,
+                parent_id: None,
+                summary: None,
+                summary_embedding: None,
+                member_ids: vec![1, 2],
+                member_count: 2,
+                algorithm: "leiden".into(),
+                quality_fn: "cpm".into(),
+                resolution: 1.0,
+                summary_model: None,
+                embed_model: None,
+                summary_tokens: None,
+                keywords: vec![],
+                topics: vec![],
+            };
+            insert_community(&conn, &pre_existing).unwrap();
+
+            // Force every INSERT into `communities` to abort.
+            conn.execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON communities \
+                 BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        }
+
+        let result = run_community_detection(&db_path, 0.5);
+        assert!(
+            result.is_err(),
+            "a forced insert failure must surface as an error"
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let stored = crate::db::communities::get_all_communities(&conn).unwrap();
+        assert!(
+            !stored.is_empty(),
+            "the pre-existing community must survive a failed replacement"
+        );
+        assert_eq!(stored.len(), 1, "only the pre-existing community remains");
+        assert_eq!(stored[0].label, "pre-existing");
     }
 }

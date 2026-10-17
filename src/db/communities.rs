@@ -31,6 +31,10 @@ pub struct Community {
     pub summary_model: Option<String>,
     pub embed_model: Option<String>,
     pub summary_tokens: Option<i64>,
+    /// Keywords extracted by the summarizer (persisted as a JSON array).
+    pub keywords: Vec<String>,
+    /// Topics extracted by the summarizer (persisted as a JSON array).
+    pub topics: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,13 +46,32 @@ pub struct Community {
 pub fn insert_community(conn: &rusqlite::Connection, community: &Community) -> Result<i64> {
     let member_ids_json = serde_json::to_string(&community.member_ids)
         .context("failed to serialise member_ids as JSON")?;
+    // A freshly detected community has no keywords/topics yet; store NULL
+    // (not "[]") so "unsummarized" rows are distinguishable from summarized
+    // rows that legitimately carry empty arrays.
+    let keywords_json = if community.keywords.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&community.keywords)
+                .context("failed to serialise keywords as JSON")?,
+        )
+    };
+    let topics_json = if community.topics.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&community.topics)
+                .context("failed to serialise topics as JSON")?,
+        )
+    };
 
     conn.execute(
         "INSERT INTO communities \
          (label, level, parent_id, summary, summary_embedding, \
           member_ids, member_count, algorithm, quality_fn, resolution, \
-          summary_model, embed_model, summary_tokens) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          summary_model, embed_model, summary_tokens, keywords, topics) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             community.label,
             community.level,
@@ -63,6 +86,8 @@ pub fn insert_community(conn: &rusqlite::Connection, community: &Community) -> R
             community.summary_model,
             community.embed_model,
             community.summary_tokens,
+            keywords_json,
+            topics_json,
         ],
     )
     .context("failed to insert community")?;
@@ -76,7 +101,7 @@ pub fn get_community_by_id(conn: &rusqlite::Connection, id: i64) -> Result<Optio
     let mut stmt = conn.prepare(
         "SELECT id, label, level, parent_id, summary, summary_embedding, \
                 member_ids, member_count, algorithm, quality_fn, resolution, \
-                summary_model, embed_model, summary_tokens \
+                summary_model, embed_model, summary_tokens, keywords, topics \
          FROM communities WHERE id = ?1",
     )?;
 
@@ -95,8 +120,8 @@ pub fn get_communities_by_level(conn: &rusqlite::Connection, level: i32) -> Resu
     let mut stmt = conn.prepare(
         "SELECT id, label, level, parent_id, summary, summary_embedding, \
                 member_ids, member_count, algorithm, quality_fn, resolution, \
-                summary_model, embed_model, summary_tokens \
-         FROM communities WHERE level = ?1 ORDER BY id",
+                summary_model, embed_model, summary_tokens, keywords, topics \
+         FROM communities WHERE level = ?1 ORDER BY level, id",
     )?;
 
     let rows = stmt.query_map(rusqlite::params![level], parse_community_row)?;
@@ -109,8 +134,8 @@ pub fn get_all_communities(conn: &rusqlite::Connection) -> Result<Vec<Community>
     let mut stmt = conn.prepare(
         "SELECT id, label, level, parent_id, summary, summary_embedding, \
                 member_ids, member_count, algorithm, quality_fn, resolution, \
-                summary_model, embed_model, summary_tokens \
-         FROM communities ORDER BY id",
+                summary_model, embed_model, summary_tokens, keywords, topics \
+         FROM communities ORDER BY level, id",
     )?;
 
     let rows = stmt.query_map([], parse_community_row)?;
@@ -119,6 +144,7 @@ pub fn get_all_communities(conn: &rusqlite::Connection) -> Result<Vec<Community>
 
 /// Update summary and related fields for an existing community.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn update_community_summary(
     conn: &rusqlite::Connection,
     id: i64,
@@ -127,24 +153,77 @@ pub fn update_community_summary(
     summary_model: &str,
     embed_model: &str,
     summary_tokens: i64,
+    keywords: &[String],
+    topics: &[String],
 ) -> Result<()> {
+    let keywords_json =
+        serde_json::to_string(keywords).context("failed to serialise keywords as JSON")?;
+    let topics_json =
+        serde_json::to_string(topics).context("failed to serialise topics as JSON")?;
+
     conn.execute(
         "UPDATE communities \
          SET summary = ?1, summary_embedding = ?2, \
-             summary_model = ?3, embed_model = ?4, summary_tokens = ?5 \
-         WHERE id = ?6",
+             summary_model = ?3, embed_model = ?4, summary_tokens = ?5, \
+             keywords = ?6, topics = ?7 \
+         WHERE id = ?8",
         rusqlite::params![
             summary,
             summary_embedding,
             summary_model,
             embed_model,
             summary_tokens,
+            keywords_json,
+            topics_json,
             id
         ],
     )
     .context("failed to update community summary")?;
 
     Ok(())
+}
+
+/// Resolve `label`s of the `nodes` referenced by `member_ids`, **in the
+/// order of `member_ids`**, silently skipping ids that do not exist.
+///
+/// The `IN` clause is chunked into batches to stay well below SQLite's
+/// bound-variable limit (`SQLITE_MAX_VARIABLE_NUMBER`) for large
+/// communities.
+#[allow(dead_code)]
+pub fn get_member_labels(conn: &rusqlite::Connection, member_ids: &[i64]) -> Result<Vec<String>> {
+    if member_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    const BATCH: usize = 500;
+    let mut by_id: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+
+    for chunk in member_ids.chunks(BATCH) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, label FROM nodes WHERE id IN ({placeholders})"
+        ))?;
+
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let id: i64 = row.get(0)?;
+            let label: String = row.get(1)?;
+            Ok((id, label))
+        })?;
+        for row in rows {
+            let (id, label) = row?;
+            by_id.insert(id, label);
+        }
+    }
+
+    Ok(member_ids
+        .iter()
+        .filter_map(|id| by_id.get(id).cloned())
+        .collect())
 }
 
 /// Load all communities that have a non-NULL `summary_embedding`.
@@ -198,6 +277,17 @@ fn parse_community_row(row: &rusqlite::Row) -> rusqlite::Result<Community> {
     let member_ids_json: String = row.get(6)?;
     let member_ids: Vec<i64> = serde_json::from_str(&member_ids_json).unwrap_or_default();
 
+    // `keywords`/`topics` are nullable; NULL and invalid JSON both map to
+    // an empty vector (an unsummarized community has NULL).
+    let keywords_json: Option<String> = row.get(14)?;
+    let keywords: Vec<String> = keywords_json
+        .map(|s| serde_json::from_str(&s).unwrap_or_default())
+        .unwrap_or_default();
+    let topics_json: Option<String> = row.get(15)?;
+    let topics: Vec<String> = topics_json
+        .map(|s| serde_json::from_str(&s).unwrap_or_default())
+        .unwrap_or_default();
+
     Ok(Community {
         id: row.get(0)?,
         label: row.get(1)?,
@@ -213,6 +303,8 @@ fn parse_community_row(row: &rusqlite::Row) -> rusqlite::Result<Community> {
         summary_model: row.get(11)?,
         embed_model: row.get(12)?,
         summary_tokens: row.get(13)?,
+        keywords,
+        topics,
     })
 }
 
@@ -268,6 +360,8 @@ mod tests {
             summary_model: None,
             embed_model: None,
             summary_tokens: None,
+            keywords: vec![],
+            topics: vec![],
         };
 
         let id = insert_community(&conn, &community).expect("insert should succeed");
@@ -326,6 +420,8 @@ mod tests {
                     summary_model: None,
                     embed_model: None,
                     summary_tokens: None,
+                    keywords: vec![],
+                    topics: vec![],
                 },
             )
             .expect("insert should succeed");
@@ -365,6 +461,8 @@ mod tests {
                     summary_model: None,
                     embed_model: None,
                     summary_tokens: None,
+                    keywords: vec![],
+                    topics: vec![],
                 },
             )
             .expect("insert should succeed");
@@ -399,13 +497,25 @@ mod tests {
                 summary_model: None,
                 embed_model: None,
                 summary_tokens: None,
+                keywords: vec![],
+                topics: vec![],
             },
         )
         .expect("insert should succeed");
 
         let emb = vector_to_blob(&[0.1_f32, 0.2_f32, 0.3_f32]);
-        update_community_summary(&conn, id, "Updated summary", &emb, "model-x", "embed-y", 42)
-            .expect("update should succeed");
+        update_community_summary(
+            &conn,
+            id,
+            "Updated summary",
+            &emb,
+            "model-x",
+            "embed-y",
+            42,
+            &[],
+            &[],
+        )
+        .expect("update should succeed");
 
         let updated = get_community_by_id(&conn, id)
             .expect("get should succeed")
@@ -447,6 +557,8 @@ mod tests {
                 summary_model: Some("m".into()),
                 embed_model: Some("e".into()),
                 summary_tokens: Some(10),
+                keywords: vec![],
+                topics: vec![],
             },
         )
         .expect("insert should succeed");
@@ -469,6 +581,8 @@ mod tests {
                 summary_model: None,
                 embed_model: None,
                 summary_tokens: None,
+                keywords: vec![],
+                topics: vec![],
             },
         )
         .expect("insert should succeed");
@@ -513,6 +627,8 @@ mod tests {
                     summary_model: None,
                     embed_model: None,
                     summary_tokens: None,
+                    keywords: vec![],
+                    topics: vec![],
                 },
             )
             .expect("insert should succeed");
@@ -531,5 +647,121 @@ mod tests {
             0,
             "should have 0 communities after delete"
         );
+    }
+
+    // ── add-community-list RED tests ──────────────────────────────────
+
+    /// RED-3 — `update_community_summary` persists `keywords`/`topics` as
+    /// JSON arrays; an unsummarized community reads NULL; empty arrays are
+    /// stored as `[]` (not NULL) and read back as empty vectors.
+    #[test]
+    fn test_update_community_summary_persists_keywords_topics() {
+        let conn = setup_db();
+
+        let id = insert_community(
+            &conn,
+            &Community {
+                id: 0,
+                label: "kw".into(),
+                level: 0,
+                parent_id: None,
+                summary: None,
+                summary_embedding: None,
+                member_ids: vec![],
+                member_count: 0,
+                algorithm: "leiden".into(),
+                quality_fn: "cpm".into(),
+                resolution: 1.0,
+                summary_model: None,
+                embed_model: None,
+                summary_tokens: None,
+                keywords: vec![],
+                topics: vec![],
+            },
+        )
+        .expect("insert should succeed");
+
+        // Never summarized → NULL keywords/topics.
+        let kw_raw: Option<String> = conn
+            .query_row(
+                "SELECT keywords FROM communities WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            kw_raw.is_none(),
+            "unsummarized community must have NULL keywords"
+        );
+
+        let emb = vector_to_blob(&[0.1_f32, 0.2_f32]);
+        update_community_summary(
+            &conn,
+            id,
+            "sum",
+            &emb,
+            "m",
+            "e",
+            7,
+            &["tar".to_string(), "zip".to_string()],
+            &["linux".to_string()],
+        )
+        .expect("update should succeed");
+
+        let c = get_community_by_id(&conn, id)
+            .expect("get should succeed")
+            .expect("community should exist");
+        assert_eq!(c.keywords, vec!["tar", "zip"], "keywords must round-trip");
+        assert_eq!(c.topics, vec!["linux"], "topics must round-trip");
+
+        // Raw JSON arrays persisted in the columns.
+        let kw_json: String = conn
+            .query_row(
+                "SELECT keywords FROM communities WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kw_json, r#"["tar","zip"]"#);
+
+        // Empty arrays are preserved as "[]", not NULL.
+        update_community_summary(&conn, id, "sum2", &emb, "m", "e", 7, &[], &[])
+            .expect("update should succeed");
+        let kw_json2: String = conn
+            .query_row(
+                "SELECT keywords FROM communities WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kw_json2, "[]", "empty keywords must be stored as []");
+        let c2 = get_community_by_id(&conn, id).unwrap().unwrap();
+        assert!(c2.keywords.is_empty(), "empty [] must read back as empty");
+        assert!(c2.topics.is_empty(), "empty [] must read back as empty");
+    }
+
+    /// RED-4 — `get_member_labels` resolves labels in `member_ids` order
+    /// and silently skips ids that do not exist.
+    #[test]
+    fn test_get_member_labels_respects_order_and_skips_missing() {
+        let conn = setup_db();
+
+        for (id, label) in [(10_i64, "Alpha"), (20, "Beta"), (30, "Gamma")] {
+            conn.execute(
+                "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, ?3, 'entity')",
+                rusqlite::params![id, crate::db::keys::node_key(label), label],
+            )
+            .unwrap();
+        }
+
+        let labels = get_member_labels(&conn, &[30, 10, 999, 20]).expect("helper should succeed");
+        assert_eq!(
+            labels,
+            vec!["Gamma", "Alpha", "Beta"],
+            "labels must follow member_ids order and skip missing ids"
+        );
+
+        let empty = get_member_labels(&conn, &[]).expect("empty input should succeed");
+        assert!(empty.is_empty(), "empty member_ids must yield empty labels");
     }
 }

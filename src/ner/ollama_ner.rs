@@ -97,6 +97,25 @@ struct OllamaResponse {
     thinking: String,
 }
 
+/// Aplana recursivamente cualquier nivel de arrays anidados presentes en
+/// `values`, preservando el orden y dejando los objetos (y demás valores no-array)
+/// tal cual.
+///
+/// Existe porque algunos modelos (p. ej. `llama3.2:3b`) envuelven el array de
+/// entidades en otro array (`[[{..}]]`). Sin aplanar, `raw_entities_to_entities`
+/// haría `.get("label")` sobre un array, obtendría `None` y descartaría todas las
+/// entidades de forma silenciosa.
+fn flatten_values(values: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut flat = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            serde_json::Value::Array(inner) => flat.extend(flatten_values(inner)),
+            other => flat.push(other),
+        }
+    }
+    flat
+}
+
 /// Parsea una respuesta JSON cruda de Ollama en un Vec de valores JSON.
 /// Intenta 3 estrategias: array directo, objeto con campo "entities"/"results", o regex.
 fn parse_entities_json(raw: &str) -> Vec<serde_json::Value> {
@@ -115,7 +134,7 @@ fn parse_entities_json(raw: &str) -> Vec<serde_json::Value> {
 
     // Intento 1: el LLM devolvió un array JSON directamente
     if let Ok(entities) = serde_json::from_str::<Vec<serde_json::Value>>(cleaned) {
-        return entities;
+        return flatten_values(entities);
     }
 
     // Intento 2: el LLM devolvió un objeto con campo "entities" o "results"
@@ -124,17 +143,21 @@ fn parse_entities_json(raw: &str) -> Vec<serde_json::Value> {
             .get("entities")
             .or_else(|| wrapper.get("results"))
             .and_then(|arr| serde_json::from_value::<Vec<serde_json::Value>>(arr.clone()).ok())
+            .map(flatten_values)
             .unwrap_or_default();
     }
 
-    // Intento 3: buscar un array JSON dentro del texto (modelos thinking o con markdown)
-    // Usamos (?s) para que . cruce saltos de línea
-    let re = regex::Regex::new(r"(?s)\[.*?\]").ok();
-    if let Some(re) = re {
-        if let Some(mat) = re.find(cleaned) {
-            let json_str = mat.as_str();
-            if let Ok(entities) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
-                return entities;
+    // Intento 3: buscar un array JSON dentro del texto (modelos thinking o con markdown).
+    // Usamos `(?s)` para que `.` cruce saltos de línea. Se prueba primero el match
+    // lazy (el más pequeño); si no parsea —p. ej. un array anidado `[[{..}]]` embebido
+    // en prosa, donde el lazy captura `[[{..}]` desbalanceado— se reintenta con un
+    // match greedy que abarca hasta el último `]`.
+    for pattern in [r"(?s)\[.*?\]", r"(?s)\[.*\]"] {
+        if let Ok(re) = regex::Regex::new(pattern) {
+            if let Some(mat) = re.find(cleaned) {
+                if let Ok(entities) = serde_json::from_str::<Vec<serde_json::Value>>(mat.as_str()) {
+                    return flatten_values(entities);
+                }
             }
         }
     }
@@ -418,5 +441,114 @@ mod tests {
         assert!(!DEFAULT_LABELS.is_empty());
         assert!(DEFAULT_LABELS.contains(&"technology"));
         assert!(DEFAULT_LABELS.contains(&"person"));
+    }
+
+    // --- fix-ner-nested-array: parseo robusto de arrays JSON anidados ---
+
+    #[test]
+    fn test_parse_json_nested_array_one_level() {
+        // Algunos modelos devuelven `[[{..}]]`: el array de entidades envuelto
+        // en otro array. Pre-fix `parse_entities_json` devolvía 1 elemento (el
+        // propio array anidado); era `raw_entities_to_entities` quien, al hacer
+        // `.get("label")` sobre un array, producía 0 entidades.
+        let parsed = parse_entities_json(r#"[[{"label":"Python","type":"language","score":0.9}]]"#);
+        assert_eq!(parsed.len(), 1);
+        assert!(
+            parsed[0].is_object(),
+            "el elemento debe ser un objeto, no un array"
+        );
+        assert_eq!(
+            parsed[0].get("label").and_then(|v| v.as_str()),
+            Some("Python")
+        );
+        let entities = raw_entities_to_entities(parsed.clone());
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].label, "Python");
+    }
+
+    #[test]
+    fn test_parse_json_deeply_nested_array() {
+        let parsed = parse_entities_json(r#"[[[{"label":"Rust","type":"language","score":0.9}]]]"#);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].get("label").and_then(|v| v.as_str()),
+            Some("Rust")
+        );
+    }
+
+    #[test]
+    fn test_parse_json_flat_array_regression() {
+        let parsed = parse_entities_json(
+            r#"[{"label":"Docker","type":"tool","score":0.8},{"label":"Linux","type":"os","score":0.7}]"#,
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].get("label").and_then(|v| v.as_str()),
+            Some("Docker")
+        );
+        assert_eq!(
+            parsed[1].get("label").and_then(|v| v.as_str()),
+            Some("Linux")
+        );
+    }
+
+    #[test]
+    fn test_parse_json_wrapper_with_nested_array() {
+        let parsed = parse_entities_json(
+            r#"{"entities":[[{"label":"Redis","type":"database","score":0.8}]]}"#,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].get("label").and_then(|v| v.as_str()),
+            Some("Redis")
+        );
+    }
+
+    #[test]
+    fn test_parse_json_empty_or_no_json() {
+        assert!(parse_entities_json("").is_empty());
+        assert!(parse_entities_json("   ").is_empty());
+        assert!(parse_entities_json("no json here at all").is_empty());
+    }
+
+    #[test]
+    fn test_flatten_values_mixed_types_and_levels() {
+        let obj_a = serde_json::json!({"label":"A"});
+        let obj_b = serde_json::json!({"label":"B"});
+        let obj_c = serde_json::json!({"label":"C"});
+        let input = vec![
+            serde_json::Value::Array(vec![serde_json::Value::Array(vec![obj_a.clone()])]),
+            obj_b.clone(),
+            serde_json::Value::Array(vec![obj_c.clone()]),
+        ];
+        let flat = flatten_values(input);
+        assert_eq!(flat, vec![obj_a, obj_b, obj_c]);
+    }
+
+    #[test]
+    fn test_flatten_values_empty_is_empty() {
+        assert!(flatten_values(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_parse_json_nested_array_in_prose() {
+        // Estrategia 3 (regex): el match lazy captura `[[{..}]` (desbalanceado) y
+        // no parsea; debe reintentarse con un match greedy.
+        let parsed = parse_entities_json(
+            r#"Aquí van las entidades: [[{"label":"Docker","type":"tool","score":0.8}]] fin"#,
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].get("label").and_then(|v| v.as_str()),
+            Some("Docker")
+        );
+    }
+
+    #[test]
+    fn test_parse_json_wrapper_with_results_field() {
+        let parsed =
+            parse_entities_json(r#"{"results":[{"label":"Go","type":"language","score":0.8}]}"#);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].get("label").and_then(|v| v.as_str()), Some("Go"));
     }
 }

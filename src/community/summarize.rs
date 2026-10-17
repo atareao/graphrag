@@ -12,6 +12,7 @@ use log::{info, warn};
 use rusqlite::Connection;
 
 use crate::db::communities;
+use crate::db::schema;
 use crate::embed::ollama::OllamaClient;
 use crate::vector::vector_to_blob;
 
@@ -221,6 +222,12 @@ pub fn summarize_all_communities(
 ) -> Result<(usize, i64)> {
     let conn = Connection::open(db_path).context("failed to open database")?;
 
+    // Apply the idempotent schema migrations before reading/updating
+    // `communities`: a legacy (v2) database lacks the `keywords`/`topics`
+    // columns and `get_all_communities` would fail with
+    // `no such column: keywords`.
+    schema::init_db(&conn).context("failed to initialise/migrate the database schema")?;
+
     // Get all communities that need summarization
     let all_communities =
         communities::get_all_communities(&conn).context("failed to get all communities")?;
@@ -275,6 +282,8 @@ pub fn summarize_all_communities(
                     summary_model,
                     embed_model,
                     result.tokens,
+                    &result.keywords,
+                    &result.topics,
                 )
                 .context("failed to update community summary")?;
 
@@ -638,6 +647,8 @@ mod tests {
                 summary_model: Some("model-x".into()),
                 embed_model: Some("embed-y".into()),
                 summary_tokens: Some(42),
+                keywords: vec![],
+                topics: vec![],
             };
             communities::insert_community(&conn, &community).unwrap();
         }
@@ -651,5 +662,116 @@ mod tests {
         .expect("summarize with all already done should succeed");
         assert_eq!(count, 0, "should return 0 summaries");
         assert_eq!(tokens, 0, "should return 0 tokens");
+    }
+
+    // ------------------------------------------------------------------
+    // RED-5 — the summarize pipeline persists keywords/topics
+    //
+    // `summarize_all_communities` persists the LLM's `keywords`/`topics`
+    // via `communities::update_community_summary`; today the helper drops
+    // them.  This pins that the persistence helper accepts and stores both.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_summarize_persistence_passes_keywords_topics() {
+        let conn = setup_db();
+        let id = insert_community(&conn, "kw-community", 1, vec![1, 2]);
+
+        let emb = vector_to_blob(&[0.1_f32, 0.2_f32]);
+        communities::update_community_summary(
+            &conn,
+            id,
+            "Resumen de la comunidad",
+            &emb,
+            "llama3.2:3b",
+            "nomic-embed-text",
+            5,
+            &["python".to_string(), "fastapi".to_string()],
+            &["web".to_string()],
+        )
+        .expect("update should succeed");
+
+        let stored = communities::get_community_by_id(&conn, id)
+            .expect("get should succeed")
+            .expect("community should exist");
+        assert_eq!(
+            stored.keywords,
+            vec!["python", "fastapi"],
+            "summarize must persist keywords"
+        );
+        assert_eq!(stored.topics, vec!["web"], "summarize must persist topics");
+    }
+
+    // ==================================================================
+    // RED — fix-community-schema-migration (community-summarization delta)
+    //
+    // `summarize_all_communities` MUST migrate the schema (v2 → v3) before
+    // reading/updating `communities`, otherwise its `get_all_communities`
+    // call fails with `no such column: keywords` on a v2 database.
+    // ==================================================================
+
+    /// RED-4 — over a v2 database with an already-summarized community,
+    /// `summarize_all_communities` migrates to v3 and early-returns `(0, 0)`
+    /// without contacting Ollama.
+    #[test]
+    fn test_summarize_all_communities_migrates_v2_db() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            init_db(&conn).unwrap();
+
+            // A community that already carries a summary → nothing to do.
+            let emb = vector_to_blob(&[0.1_f32, 0.2_f32]);
+            let community = Community {
+                id: 0,
+                label: "already-done".into(),
+                level: 1,
+                parent_id: None,
+                summary: Some("Already summarized".into()),
+                summary_embedding: Some(emb),
+                member_ids: vec![1, 2],
+                member_count: 2,
+                algorithm: "leiden".into(),
+                quality_fn: "cpm".into(),
+                resolution: 1.0,
+                summary_model: Some("model-x".into()),
+                embed_model: Some("embed-y".into()),
+                summary_tokens: Some(42),
+                keywords: vec![],
+                topics: vec![],
+            };
+            communities::insert_community(&conn, &community).unwrap();
+
+            // Downgrade to the v2 shape (no keywords/topics columns).
+            conn.execute_batch(
+                "ALTER TABLE communities DROP COLUMN keywords;
+                 ALTER TABLE communities DROP COLUMN topics;
+                 PRAGMA user_version=2;",
+            )
+            .unwrap();
+        }
+
+        // Point at an unreachable port: the early return must not call Ollama.
+        let (count, tokens) = summarize_all_communities(
+            &db_path,
+            "http://127.0.0.1:1",
+            "llama3.2:3b",
+            "nomic-embed-text",
+        )
+        .expect("summarize on a v2 db must migrate and succeed");
+
+        assert_eq!(
+            (count, tokens),
+            (0, 0),
+            "an already-summarized community must early-return without Ollama"
+        );
+
+        let conn = Connection::open(&db_path).unwrap();
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3, "summarize must leave the database at user_version 3");
     }
 }

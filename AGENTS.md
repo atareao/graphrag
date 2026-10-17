@@ -142,10 +142,17 @@ cargo install graphrag-search   # instalación desde el registro
 
 ### Quick start
 
+`seed` **requiere Ollama** (usa `ollama.embed` para entidades, notas y chunks). Sin Ollama falla
+con `Error connecting to Ollama`, sale con código no-cero y **no deja ningún fichero de BD** (es
+atómico: borra el fichero parcial). Además, `seed` inserta un chunk con embedding por cada nota
+demo, así que la **demo ya es buscable**: `search`/`ask`/`similar --label` devuelven resultados
+sobre ella (con Ollama en marcha). Para datos reales, usa `build`.
+
 ```bash
 cargo build --release
-./target/release/graphrag seed graph.db
-./target/release/graphrag search "Python" graph.db -k 5
+./target/release/graphrag seed graph.db        # requiere Ollama
+./target/release/graphrag stats graph.db        # no requiere Ollama
+./target/release/graphrag fts "Python" graph.db # no requiere Ollama
 ```
 
 ### Commands
@@ -154,38 +161,48 @@ cargo build --release
 |---------|---------|
 | `init db <db>` | Create empty DB with schema |
 | `init neovim` | Generate Neovim plugin Lua config |
-| `seed <db>` | Populate demo data (44 nodes, ~113 edges) |
-| `build <repo> <db>` | Scan `.md` dir, extract entities via Ollama NER, build graph. Default repo: `.` |
-| `search <query> <db>` | Hybrid search (vectors + graph expansion) |
-| `ask <query> <db>` | RAG: hybrid retrieval + communities → Ollama answer with cited sources |
-| `similar [--label <l>\|--file <f>] <db>` | Similarity search: notes similar to an existing label or an external `.md` file |
+| `seed <db>` | Populate demo data. **Requiere Ollama**; inserta un chunk con embedding por nota, así que la demo ya es buscable (search/ask/similar devuelven resultados con Ollama) |
+| `build <repo> <db>` | Scan `.md` dir, extract entities via Ollama NER, build graph. **Requiere Ollama**. Default repo: `.` |
+| `search <query> <db>` | Hybrid search (vectors + graph expansion). **Requiere Ollama** y una BD con chunks (la demo de `seed`, o un grafo via `build`) |
+| `ask <query> <db>` | RAG: hybrid retrieval + communities → Ollama answer with cited sources. **Requiere Ollama** y chunks |
+| `similar [--label <l>\|--file <f>] <db>` | Similarity search: notes similar to a label or external `.md`. `--label` no requiere Ollama; `--file` sí |
 | `fts <query> <db>` | FTS5 exact-text search |
 | `graph <label> <db>` | Show neighbors of a node |
 | `path <from> <to> <db>` | Shortest path between two nodes |
 | `stats <db>` | Graph statistics |
 | `reset <db>` | Delete DB and recreate empty (rm + init) |
 | `map` | Interactive concept map TUI |
-| `community` | Community detection and summarization |
+| `community` | Community detection (`detect`) and summarization (`summarize`, **requiere Ollama**) |
 | `mcp --db <db>` | MCP server over stdio (JSON-RPC 2.0) |
-| `completions <shell>` | Generate shell completions (bash/zsh/fish) |
+| `completions <shell>` | Generate shell completions (bash/elvish/fish/powershell/zsh) |
 
 ### Key flags
 
 | Flag | Applies to | Default | Notes |
 |------|-----------|---------|-------|
-| `-k` | search | 5 | Number of results |
-| `-d` | search, graph | 2 | Graph expansion depth |
-| `-a` | search | 0.7 | Vector weight (0.0=pure graph, 1.0=pure vector) |
-| `--notes-only` | search | false | Show only notes (no entities/tags) |
-| `--min-weight` | search | none | Filter edges by minimum weight |
+| `-k` | search, similar, ask | 5 | Number of results |
+| `-d` | search, similar, ask, graph, map | 2 | Graph expansion depth. `-d 0` = solo vectorial (no hay flag `--vector-only`) |
+| `-a` | search, ask | 0.7 | Vector weight (0.0=pure graph, 1.0=pure vector) |
+| `--notes-only` | search, similar, ask, fts | false | Show only notes (no entities/tags) |
+| `--min-weight` | search, similar, ask | none | Filter edges by minimum weight |
 | `--format` | search, similar, fts, ask | table | Output format: `table`, `list` (markdown links to notes), `json` |
+| `-m, --max-depth` | path | 10 | Maximum path depth |
+| `-l, --limit` | fts | 10 | Maximum results |
+| `--answer` | search | false | Generate an Ollama answer for the query |
+| `--filter` | search, similar, ask | none | Metadata filter expression |
 | `--communities` | ask | 3 | Max community summaries in RAG context |
 | `--model` | ask | config summary_model | Ollama model for answer generation |
-| `--ollama-url` | build, search, mcp | `http://localhost:11434` | |
+| `--ollama-url` | build, search, ask, seed, mcp, community summarize | `http://localhost:11434` | |
 | `--ner-model` | build | `llama3.2:3b` | Model for entity extraction |
-| `--embed-model` | build, search, mcp | `nomic-embed-text` | Model for embeddings |
+| `--embed-model` | build, search, ask, seed, mcp, community summarize | `bge-m3:latest` | Model for embeddings |
+| `--db` | mcp | config db | DB path for the MCP server (no posicional) |
+| `--resolution` | community detect | 1.0 | Leiden (CPM) resolution parameter |
+| `--summary-model` | community summarize | `llama3.2:3b` | Ollama model for community summaries |
 | `-C` | global | none | Override config file path |
 | `num_threads` | config | 4 | Parallel NER workers for build |
+
+> **Nota:** no existe ningún flag `--ollama` (las embeddings siempre vienen de Ollama; `search`
+> siempre embebe la consulta con Ollama) ni ningún flag `--vector-only`.
 
 ### Architecture
 
@@ -193,44 +210,56 @@ cargo build --release
 src/
 ├── main.rs              ← CLI entrypoint (clap, 15 subcommands)
 ├── config.rs            ← TOML config (XDG: ~/.config/graphrag/config.toml, auto-created)
-├── db/schema.rs         ← SQLite schema + FTS5 (no triggers)
-├── db/keys.rs           ← Identidad de nodos: note:<ruta> / node:<label>
+├── db/
+│   ├── schema.rs        ← SQLite schema + FTS5 (no triggers)
+│   ├── keys.rs          ← Identidad de nodos: note:<ruta> / node:<label>
+│   ├── chunks.rs        ← Almacenamiento/consulta de chunks (tabla `chunks`)
+│   └── communities.rs   ← Persistencia de comunidades detectadas
 ├── graph/
 │   ├── build.rs         ← Incremental build (SHA256 hash-based, parallel NER + serial writer)
 │   └── expand.rs        ← CTE recursive expansion + shortest path
-├── search/hybrid.rs     ← HybridSearch: 3-phase (vector → rerank → graph)
+├── search/
+│   ├── hybrid.rs        ← HybridSearch: 3-phase (vector → rerank → graph)
+│   └── filter.rs        ← Filtros de metadata (--filter)
 ├── embed/ollama.rs      ← Ollama HTTP client (blocking reqwest)
-├── vector/
-│   ├── mod.rs           ← f32 <-> BLOB, cosine similarity
-│   └── synthetic.rs     ← Deterministic hash-based embeddings (no Ollama needed)
+├── vector/mod.rs        ← f32 <-> BLOB, cosine similarity (todas las embeddings vía Ollama)
 ├── chunking/markdown.rs ← Frontmatter parsing, section chunking
 ├── ner/ollama_ner.rs    ← LLM-based entity extraction (batch mode, JSON format, temp=0.1)
-├── mcp/mod.rs           ← MCP server (stdio, JSON-RPC 2.0)
-└── seed/demo_data.rs    ← Demo data generator
+├── map/
+│   ├── mod.rs           ← Concept map command
+│   ├── layout.rs        ← Force-directed layout (usa `rand`)
+│   └── tui.rs           ← Terminal UI interactiva
+├── community/
+│   ├── detect.rs        ← Detección de comunidades (Leiden, --resolution)
+│   ├── summarize.rs     ← Resumen de comunidades vía Ollama (--summary-model)
+│   └── search.rs        ← Búsqueda en resúmenes de comunidades
+├── seed/demo_data.rs    ← Demo data generator (requiere Ollama; chunks + embeddings por nota)
+└── mcp/mod.rs           ← MCP server (stdio, JSON-RPC 2.0)
 ```
 
 ### Quirks & gotchas
 
-- **Config file is auto-created** on first run at `$XDG_CONFIG_HOME/graphrag/config.toml` with documented defaults. All fields optional. CLI flags override config.
+- **Config file is auto-created** on first run at `$XDG_CONFIG_HOME/graphrag/config.toml` with documented defaults (db=`graph.db`, ollama_url=`http://localhost:11434`, embed_model=`bge-m3:latest`, ner_model=`llama3.2:3b`, summary_model=`llama3.2:3b`, k=5, depth=2, alpha=0.7, notes_dir=``, num_threads=4). All fields optional. CLI flags override config.
 - **`graphrag.db` default is a sentinel.** If the CLI default `graphrag.db` is used, it falls back to the config file value. This means `graphrag search "foo"` uses the config DB, not a literal `graphrag.db` file.
 - **FTS5 is repopulated from scratch** after every `build` (no triggers). This avoids a SQLite 3.x bug where FTS5 `'delete'` fails with empty content.
 - **Build is incremental.** Each note stores a SHA256 hash in metadata. Only new/modified files are reprocessed. Deleted files are pruned automatically.
 - **Build uses `unchecked_transaction`** per file (not nested). Each file gets its own transaction.
-- **Build computes synthetic embeddings** for every node (notes, entities, tags) using deterministic hash-based embeddings. No Ollama needed for search after build.
 - **Build is parallel.** N worker threads do NER in parallel, sending results through a channel to a single writer thread (avoids SQLite lock contention). Number of threads configurable via `num_threads` in config.
 - **NER batch mode.** All chunks of a file are sent in a single Ollama call with `---SECTION N---` markers. The model returns entities with a `section` field.
 - **NER retry with backoff.** On connection error, retries 3 times (2s, 4s, 8s). If all fail, the file is skipped entirely (not inserted without entities).
-- **NER requires Ollama.** If Ollama is unreachable or the model is not found, `build` warns per-chunk and continues with empty entities. The `search` command defaults to synthetic embeddings unless `--ollama` is passed.
+- **NER requires Ollama.** If Ollama is unreachable or the model is not found, `build` warns per-chunk and continues with empty entities. `search` **siempre** usa Ollama para embeber la consulta; **no existe** ningún flag `--ollama`.
 - **NER model must support plain-text JSON output.** Some models (e.g. some Qwen variants) don't support Ollama's `format: json` mode and return empty responses. The prompt already asks for JSON explicitly — if a model returns empty, try a different model like `llama3.2:3b`.
 - **"Thinking" models** (qwen3.5, deepseek-r1) put their response in the `thinking` field instead of `response`. The code falls back to `thinking` and uses regex to extract JSON arrays.
-- **Synthetic embeddings** are deterministic (hash-based LCG + Box-Muller). Same text → same vector. No Ollama needed for basic search.
+- **No hay modo sin Ollama.** Todas las embeddings provienen de Ollama (`src/vector/synthetic.rs` fue eliminado). No hay embeddings sintéticos ni fallback local.
+- **La BD demo (`seed`) ya es buscable.** `seed` inserta, por cada nota demo, una fila en `chunks` con un embedding no nulo (reutiliza el embedding que calcula para el nodo de la nota), así que `search`/`ask`/`similar --label` devuelven resultados sobre ella con Ollama en marcha.
+- **`seed` es atómico y requiere Ollama.** Si Ollama no está accesible falla con "Error connecting to Ollama", sale con código no-cero y no deja ningún fichero de BD (se borra el parcial).
 - **MCP server** runs over stdio (JSON-RPC 2.0). Protocol version `2024-11-05`. Exposes 7 tools + 5 resources.
 
 ### Module deep-dive
 
 #### `src/main.rs` (720 lines)
 
-Entrypoint CLI con `clap` derive. Define 11 subcomandos + 2 sub-subcomandos de `init`. Implementa la lógica de "sentinel" para `graphrag.db`: si el valor por defecto no se ha cambiado, usa el valor del archivo de configuración. Cada comando delega en una función `cmd_*`.
+Entrypoint CLI con `clap` derive. Define **15** subcomandos: `init`, `build`, `similar`, `search`, `ask`, `graph`, `map`, `fts`, `path`, `seed`, `reset`, `mcp`, `stats`, `community`, `completions`. `init` tiene 2 sub-subcomandos (`db`, `neovim`). Implementa la lógica de "sentinel" para `graphrag.db`: si el valor por defecto no se ha cambiado, usa el valor del archivo de configuración. Cada comando delega en una función `cmd_*`.
 
 #### `src/config.rs` (204 lines)
 
@@ -243,6 +272,14 @@ Esquema SQLite v2: tabla `nodes` (id, `key` TEXT UNIQUE, label, type, embedding 
 #### `src/db/keys.rs`
 
 Helpers de identidad de nodos: `note_key(ruta)` → `note:<ruta relativa>` y `node_key(label)` → `node:<label>`. Centralizan la construcción de `key` usada en upserts, lookups y migración.
+
+#### `src/db/chunks.rs`
+
+Acceso a la tabla `chunks`: inserción y consulta de fragmentos de notas con su embedding y metadatos. Es la fuente que alimenta la fase vectorial de `search`/`ask`/`similar`.
+
+#### `src/db/communities.rs`
+
+Persistencia de comunidades detectadas (miembros, resumen, embedding del resumen) para `community detect`/`summarize`/`search` y el contexto de `ask`.
 
 #### `src/graph/build.rs` (829 lines)
 
@@ -261,11 +298,15 @@ Expansión CTE recursiva bidireccional (`expand_neighbors`, `expand_neighbors_we
 #### `src/search/hybrid.rs` (528 lines)
 
 Motor `HybridSearch` con 3 fases:
-- **Fase 1 — Vector:** carga todos los embeddings, calcula similitud coseno, top-k
+- **Fase 1 — Vector:** carga los embeddings de **chunks**, calcula similitud coseno, top-k
 - **Fase 2 — Reranking:** bonifica por coincidencia en título (+0.1) y tipo note (+0.2), combina con alpha
 - **Fase 3 — Graph expansion:** CTE recursiva desde candidatos, añade vecinos con score reducido
 
-Normalización min-max final. Soporta `vector_only`, `notes_only`, `min_weight`. También `fts_search` (FTS5) y `stats`.
+Normalización min-max final. Soporta `notes_only` y `min_weight`; `-d 0` desactiva la expansión (solo vectorial). También `fts_search` (FTS5) y `stats`.
+
+#### `src/search/filter.rs`
+
+Evaluación de expresiones de filtro de metadata (`--filter`) aplicadas a los candidatos de búsqueda.
 
 #### `src/embed/ollama.rs` (123 lines)
 
@@ -275,9 +316,13 @@ Cliente HTTP síncrono (`reqwest::blocking`) para API de embeddings de Ollama. `
 
 Operaciones vectoriales: `vector_to_blob`/`blob_to_vector` (bytemuck), `dot`, `norm`, `normalize`, `cosine_similarity`/`cosine_similarity_raw`.
 
-#### `src/vector/synthetic.rs` (132 lines)
+#### `src/map/`
 
-Embeddings sintéticos deterministas: hash del texto como seed LCG, Box-Muller para distribución normal, normalización L2. `similar_embedding()` añade ruido gaussiano controlado. 4 tests.
+`mod.rs` (comando), `layout.rs` (layout force-directed, usa `rand`) y `tui.rs` (interfaz de terminal interactiva) para el mapa de conceptos.
+
+#### `src/community/`
+
+Detección de comunidades (`detect.rs`, Leiden con `--resolution`), resumen vía Ollama (`summarize.rs`, `--summary-model`) y búsqueda sobre los resúmenes (`search.rs`).
 
 #### `src/chunking/markdown.rs` (187 lines)
 
@@ -293,18 +338,18 @@ Servidor MCP sobre stdio (JSON-RPC 2.0, protocolo `2024-11-05`). Expone 7 herram
 
 #### `src/seed/demo_data.rs` (602 lines)
 
-Generador de base de datos demo: 24 entidades (tools, languages, databases, libraries, frameworks, concepts, security, os), 20 notas con relaciones, ~43 aristas de co-ocurrencia. Embeddings sintéticos deterministas. FTS5 repoblado. 7 tests.
+Generador de base de datos demo: 24 entidades (tools, languages, databases, libraries, frameworks, concepts, security, os), 20 notas con relaciones, ~113 aristas de co-ocurrencia (44 nodos). **Requiere Ollama** para calcular las embeddings (de entidades, notas y chunks) vía `ollama.embed`. Inserta embeddings a nivel de nodo y, por cada nota, un chunk con embedding en la tabla `chunks` (mismo embedding que el nodo de la nota), así que la demo es buscable: `search`/`ask`/`similar --label` devuelven resultados. FTS5 repoblado. 7 tests.
 
 ### Testing
 
 ```bash
-cargo test                    # 32 tests, 2 ignored (need Ollama)
+cargo test                    # 143 passed, 15 ignored (158 total; los ignorados necesitan Ollama)
 cargo test -- --ignored       # Run Ollama-dependent tests
 cargo clippy -- -D warnings   # Lint: zero warnings enforced
 cargo fmt --check             # Format check
 ```
 
-Tests use `tempfile` for temporary DBs. No external services needed for the 30 non-ignored tests.
+Tests use `tempfile` for temporary DBs. Los 143 tests no ignorados no necesitan servicios externos.
 
 ### Build profile
 
@@ -327,8 +372,8 @@ Release profile in `Cargo.toml`: `lto=true`, `codegen-units=1`, `strip=true`, `o
 | `anyhow` / `thiserror` | — | Manejo de errores |
 | `log` / `env_logger` | — | Logging estructurado |
 | `termcolor` / `indicatif` | — | Colores y barras de progreso |
-| `rand` | — | RNG para embeddings sintéticos |
-| `indexmap` | — | HashMap ordenado |
+| `rand` | — | RNG para el layout force-directed del mapa (`src/map/layout.rs`) |
+| `indexmap` | — | HashMap ordenado (declarada; verificar uso antes de asumir) |
 | `sha2` | — | Hashing SHA256 para build incremental |
 | `toml` / `dirs` | — | Config TOML + rutas XDG |
 | `tempfile` | dev | Bases de datos temporales en tests |
@@ -341,56 +386,3 @@ This project follows strict gitflow. See [GIT_FLOW.md](./GIT_FLOW.md) for:
 - How to create features, hotfixes, and releases
 - CI/CD workflows for automated versioning and publishing
 
-
-
-
-
-
-## Relacionados
-
-- [INFO  graphrag::config](info-graphrag::config.md)
-- [DEBUG graphrag](debug-graphrag.md)
-- [DEBUG graphrag](debug-graphrag.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [DEBUG graphrag::vector::synthetic](debug-graphrag::vector::synthetic.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [DEBUG graphrag::graph::expand](debug-graphrag::graph::expand.md)
-- [DEBUG graphrag::graph::expand](debug-graphrag::graph::expand.md)
-- [DEBUG graphrag::graph::expand](debug-graphrag::graph::expand.md)
-- [DEBUG graphrag::graph::expand](debug-graphrag::graph::expand.md)
-- [DEBUG graphrag::graph::expand](debug-graphrag::graph::expand.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [DEBUG graphrag::search::hybrid](debug-graphrag::search::hybrid.md)
-- [note    ](note-.md)
-- [tool    ](tool-.md)
-- [device  ](device-.md)
-- [format  ](format-.md)
-- [class   ](class-.md)
-- [domain  ](domain-.md)
-- [domain  ](domain-.md)
-- [domain  ](domain-.md)
-- [note    ](note-.md)
-- [tool    ](tool-.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 0](dist-0.md)
-- [dist 1](dist-1.md)
-- [dist 1](dist-1.md)
-- [dist 1](dist-1.md)
-- [dist 1](dist-1.md)
-- [dist 1](dist-1.md)
-- [dist 1](dist-1.md)
-- [dist 1](dist-1.md)

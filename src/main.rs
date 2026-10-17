@@ -98,6 +98,9 @@ enum Commands {
         /// Formato de salida: table, list, json
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+        /// Ocultar el contenido (preview del chunk) en la salida de tabla
+        #[arg(long)]
+        no_content: bool,
     },
     /// Búsqueda híbrida (vectores + grafos)
     Search {
@@ -138,6 +141,9 @@ enum Commands {
         /// Formato de salida: table, list, json
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+        /// Ocultar el contenido (preview del chunk) en la salida de tabla
+        #[arg(long)]
+        no_content: bool,
     },
     /// Responde una pregunta en lenguaje natural (RAG: retrieval híbrido + generación con Ollama)
     Ask {
@@ -221,6 +227,9 @@ enum Commands {
         /// Formato de salida: table, list, json
         #[arg(long, default_value = "table")]
         format: OutputFormat,
+        /// Ocultar el contenido (preview del chunk) en la salida de tabla
+        #[arg(long)]
+        no_content: bool,
     },
     /// Camino más corto entre dos nodos
     Path {
@@ -307,6 +316,21 @@ enum CommunityCommands {
         /// Modelo de embeddings
         #[arg(long, default_value = "nomic-embed-text")]
         embed_model: String,
+    },
+    /// Lista las comunidades almacenadas (no requiere Ollama)
+    List {
+        /// Ruta a la base de datos
+        #[arg(default_value = "graphrag.db")]
+        db: String,
+        /// Mostrar solo las comunidades de este nivel
+        #[arg(long)]
+        level: Option<i32>,
+        /// Número máximo de comunidades a mostrar (0 = sin límite, todas)
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Formato de salida: table, json
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
     },
 }
 
@@ -397,6 +421,7 @@ fn main() -> Result<()> {
             filter,
             answer,
             format,
+            no_content,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let k = if k == 5 { cfg.k } else { k };
@@ -435,6 +460,7 @@ fn main() -> Result<()> {
                 &filter,
                 answer,
                 &format,
+                no_content,
             )
         }
         Commands::Ask {
@@ -498,6 +524,7 @@ fn main() -> Result<()> {
             notes_only,
             filter,
             format,
+            no_content,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             let k = if k == 5 { cfg.k } else { k };
@@ -505,6 +532,7 @@ fn main() -> Result<()> {
             debug!("Comando: similar label={:?}, file={:?}", label, file);
             cmd_similar(
                 label, file, db, k, depth, min_weight, notes_only, &filter, &cfg, &format,
+                no_content,
             )
         }
         Commands::Graph { label, db, depth } => {
@@ -525,13 +553,14 @@ fn main() -> Result<()> {
             limit,
             notes_only,
             format,
+            no_content,
         } => {
             let db = if db == "graphrag.db" { &cfg.db } else { &db };
             debug!(
                 "Comando: fts query='{}', limit={}, notes_only={}",
                 query, limit, notes_only
             );
-            cmd_fts(&query, db, limit, notes_only, &format)
+            cmd_fts(&query, db, limit, notes_only, &format, no_content)
         }
         Commands::Path {
             from,
@@ -618,6 +647,15 @@ fn main() -> Result<()> {
                     &embed_model
                 };
                 cmd_community_summarize(db, ollama_url, summary_model, embed_model)
+            }
+            CommunityCommands::List {
+                db,
+                level,
+                limit,
+                format,
+            } => {
+                let db = if db == "graphrag.db" { &cfg.db } else { &db };
+                cmd_community_list(db, level, limit, format)
             }
         },
         Commands::Completions { shell } => {
@@ -877,6 +915,7 @@ fn cmd_search(
     filter: &[String],
     answer: bool,
     format: &OutputFormat,
+    no_content: bool,
 ) -> Result<()> {
     // Parse filters (fail early on invalid syntax)
     let filters: Vec<search::filter::Filter> = filter
@@ -916,7 +955,7 @@ fn cmd_search(
         hs.hybrid_search(query, k, depth, alpha, min_weight, notes_only, &filters)?
     };
 
-    display_results(&results, format);
+    display_results(&results, format, no_content);
 
     // ── Mostrar comunidades relacionadas ──
     {
@@ -1037,7 +1076,7 @@ fn cmd_ask(
                     );
                 } else {
                     println!("\n🧠 RESULTADOS DE RETRIEVAL\n{}", "─".repeat(50));
-                    display_results(&[], format);
+                    display_results(&[], format, false);
                 }
                 return Ok(());
             }
@@ -1098,7 +1137,7 @@ fn cmd_ask(
                 );
             } else {
                 println!("\n🧠 RESULTADOS DE RETRIEVAL\n{}", "─".repeat(50));
-                display_results(&results, format);
+                display_results(&results, format, false);
             }
             eprintln!("⚠️  answer generation skipped; is Ollama running?");
         }
@@ -1145,6 +1184,7 @@ fn cmd_similar(
     filter: &[String],
     cfg: &config::GraphRagConfig,
     format: &OutputFormat,
+    no_content: bool,
 ) -> Result<()> {
     // Validar que exactamente uno de --label o --file esté presente
     match (&label, &file) {
@@ -1183,7 +1223,7 @@ fn cmd_similar(
         }
 
         let results = hs.similar_by_label(lbl, k, depth, min_weight, notes_only, &filters)?;
-        display_results(&results, format);
+        display_results(&results, format, no_content);
     } else if let Some(f) = &file {
         if !matches!(format, OutputFormat::Json) {
             println!("\n🔍 Similares a archivo: '{}'", f);
@@ -1195,7 +1235,7 @@ fn cmd_similar(
         }
 
         let results = hs.similar_by_file(f, k, depth, min_weight, notes_only, &filters)?;
-        display_results(&results, format);
+        display_results(&results, format, no_content);
     }
 
     Ok(())
@@ -1218,7 +1258,7 @@ fn cmd_community_detect(db: &str, resolution: f64) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            eprintln!("❌ Error detectando comunidades: {}", e);
+            eprintln!("❌ Error detectando comunidades: {:#}", e);
             Ok(())
         }
     }
@@ -1249,10 +1289,151 @@ fn cmd_community_summarize(
             Ok(())
         }
         Err(e) => {
-            eprintln!("❌ Error resumiendo comunidades: {}", e);
+            eprintln!("❌ Error resumiendo comunidades: {:#}", e);
             Ok(())
         }
     }
+}
+
+/// Truncate `s` to at most `max_len` characters, appending `…` when cut.
+/// Char-based so it is safe on multibyte UTF-8.
+fn truncate_preview(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Select communities for `community list`: optionally filtered by level,
+/// ordered deterministically by `(level, id)` (the SQL queries already
+/// guarantee this order; the in-memory sort is a defensive backup), then
+/// truncated to `limit` (when `limit > 0`; `0` means "no limit").
+fn select_communities(
+    conn: &rusqlite::Connection,
+    level: Option<i32>,
+    limit: usize,
+) -> Result<Vec<crate::db::communities::Community>> {
+    let mut communities = match level {
+        Some(l) => crate::db::communities::get_communities_by_level(conn, l)?,
+        None => crate::db::communities::get_all_communities(conn)?,
+    };
+
+    communities.sort_by_key(|c| (c.level, c.id));
+
+    if limit > 0 && communities.len() > limit {
+        communities.truncate(limit);
+    }
+
+    Ok(communities)
+}
+
+/// Build the JSON array for `community list --format json`, resolving each
+/// community's member entity labels.
+fn community_list_json(
+    conn: &rusqlite::Connection,
+    communities: &[crate::db::communities::Community],
+) -> Result<String> {
+    let entries: Vec<serde_json::Value> = communities
+        .iter()
+        .map(|c| -> Result<serde_json::Value> {
+            let members = crate::db::communities::get_member_labels(conn, &c.member_ids)?;
+            Ok(serde_json::json!({
+                "id": c.id,
+                "label": c.label,
+                "level": c.level,
+                "parent_id": c.parent_id,
+                "member_count": c.member_count,
+                "keywords": c.keywords,
+                "topics": c.topics,
+                "summary": c.summary,
+                "members": members,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(serde_json::to_string_pretty(&entries)?)
+}
+
+fn cmd_community_list(
+    db: &str,
+    level: Option<i32>,
+    limit: usize,
+    format: OutputFormat,
+) -> Result<()> {
+    let conn = rusqlite::Connection::open(db)?;
+
+    // Guard against an uninitialized database: `Connection::open` happily
+    // creates an empty file, and querying `communities` would then fail with
+    // a raw "no such table" error.  Fail early with an actionable message.
+    let communities_table_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='communities'",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(
+        communities_table_exists > 0,
+        "La base de datos '{db}' no contiene una tabla 'communities'. \
+         ¿Ejecutaste 'graphrag init db' y 'graphrag community detect'?"
+    );
+
+    // The table exists: apply the idempotent schema migrations (v2 → v3)
+    // before listing, so the `keywords`/`topics` SELECT works on a legacy
+    // database.
+    crate::db::schema::init_db(&conn)?;
+
+    let communities = select_communities(&conn, level, limit)?;
+
+    match format {
+        OutputFormat::Json => {
+            let json = community_list_json(&conn, &communities)?;
+            println!("{}", json);
+        }
+        _ => {
+            if communities.is_empty() {
+                println!(
+                    "No hay comunidades. Ejecuta 'graphrag community detect {}' primero.",
+                    db
+                );
+                return Ok(());
+            }
+
+            println!(
+                "{:>4}  {:>5}  {:>4}  {:<40}  miembros",
+                "id", "nivel", "n", "palabras clave"
+            );
+            println!("{}", "─".repeat(90));
+
+            for c in &communities {
+                let keywords = if c.keywords.is_empty() {
+                    c.label.clone()
+                } else {
+                    c.keywords.join(", ")
+                };
+
+                let miembros = match &c.summary {
+                    Some(summary) => truncate_preview(summary, 60),
+                    None => {
+                        let labels =
+                            crate::db::communities::get_member_labels(&conn, &c.member_ids)?;
+                        truncate_preview(&labels.join(", "), 60)
+                    }
+                };
+
+                println!(
+                    "{:>4}  {:>5}  {:>4}  {:<40}  {}",
+                    c.id,
+                    c.level,
+                    c.member_count,
+                    truncate_preview(&keywords, 40),
+                    miembros
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_graph(label: &str, db: &str, depth: i32) -> Result<()> {
@@ -1288,6 +1469,7 @@ fn cmd_fts(
     limit: usize,
     notes_only: bool,
     format: &OutputFormat,
+    no_content: bool,
 ) -> Result<()> {
     let ollama = embed::ollama::OllamaClient::new("http://localhost:11434", "nomic-embed-text");
     let hs = search::HybridSearch::new(db, ollama)?;
@@ -1302,7 +1484,7 @@ fn cmd_fts(
 
     let results = hs.fts_search(query, limit, notes_only)?;
 
-    display_results(&results, format);
+    display_results(&results, format, no_content);
 
     Ok(())
 }
@@ -1355,13 +1537,22 @@ fn cmd_stats(db: &str) -> Result<()> {
     Ok(())
 }
 
-/// Formats search results based on OutputFormat and prints to stdout
-fn display_results(results: &[crate::search::SearchResult], format: &OutputFormat) {
+/// Renders search results into `out`, honoring the output format and the
+/// `--no-content` flag (which suppresses the per-result `└──` chunk preview).
+///
+/// Kept separate from [`display_results`] so it can write into any sink
+/// (e.g. a `Vec<u8>` in tests) instead of being hard-wired to stdout.
+fn render_results(
+    results: &[crate::search::SearchResult],
+    format: &OutputFormat,
+    no_content: bool,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
     match format {
         OutputFormat::Table => {
             if results.is_empty() {
-                println!("   (sin resultados)");
-                return;
+                writeln!(out, "   (sin resultados)")?;
+                return Ok(());
             }
             for r in results {
                 let file_info = if !r.file.is_empty() {
@@ -1370,11 +1561,12 @@ fn display_results(results: &[crate::search::SearchResult], format: &OutputForma
                     String::new()
                 };
                 let n_count = r.neighbors.len();
-                println!(
+                writeln!(
+                    out,
                     "   {:>10.3}  [{:8}] {}{}  (vecinos: {})",
                     r.score, r.r#type, r.label, file_info, n_count
-                );
-                if !r.chunk_header.is_empty() {
+                )?;
+                if !no_content && !r.chunk_header.is_empty() {
                     // Truncate content for display, same as clip_text in hybrid.rs
                     let preview = if r.content.len() > 200 {
                         let cutoff = r
@@ -1387,16 +1579,16 @@ fn display_results(results: &[crate::search::SearchResult], format: &OutputForma
                     } else {
                         r.content.clone()
                     };
-                    println!("   └── {}: {}", r.chunk_header, preview);
+                    writeln!(out, "   └── {}: {}", r.chunk_header, preview)?;
                 }
             }
             // Show neighbors of first result
             if let Some(first) = results.first() {
                 if !first.neighbors.is_empty() {
-                    println!("\n🔗 Vecinos de '{}':", first.label);
-                    println!("{}", "─".repeat(50));
+                    writeln!(out, "\n🔗 Vecinos de '{}':", first.label)?;
+                    writeln!(out, "{}", "─".repeat(50))?;
                     for n in &first.neighbors {
-                        println!("   [dist {}] {} ({})", n.distance, n.label, n.r#type);
+                        writeln!(out, "   [dist {}] {} ({})", n.distance, n.label, n.r#type)?;
                     }
                 }
             }
@@ -1404,15 +1596,30 @@ fn display_results(results: &[crate::search::SearchResult], format: &OutputForma
         OutputFormat::List => {
             for r in results {
                 if r.r#type == "note" && !r.file.is_empty() {
-                    println!("- [{}]({})", r.label, r.file);
+                    writeln!(out, "- [{}]({})", r.label, r.file)?;
                 }
             }
         }
         OutputFormat::Json => match serde_json::to_string_pretty(results) {
-            Ok(json) => println!("{}", json),
+            Ok(json) => writeln!(out, "{}", json)?,
             Err(e) => eprintln!("❌ Error serializando resultados: {}", e),
         },
     }
+    Ok(())
+}
+
+/// Formats search results based on OutputFormat and prints to stdout.
+///
+/// When `no_content` is true, the per-result chunk preview (`└── ...`) is
+/// suppressed in table output.
+fn display_results(
+    results: &[crate::search::SearchResult],
+    format: &OutputFormat,
+    no_content: bool,
+) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = render_results(results, format, no_content, &mut lock);
 }
 
 #[cfg(test)]
@@ -1424,7 +1631,7 @@ mod tests {
     fn test_display_table_empty() {
         let results: Vec<SearchResult> = vec![];
         // Just verify it doesn't panic
-        display_results(&results, &OutputFormat::Table);
+        display_results(&results, &OutputFormat::Table, false);
     }
 
     #[test]
@@ -1455,9 +1662,9 @@ mod tests {
         ];
         // Since we can't easily capture stdout in a simple test,
         // this test verifies no panic and correct filtering logic by checking the function runs
-        display_results(&results, &OutputFormat::List);
+        display_results(&results, &OutputFormat::List, false);
         // Also test JSON mode
-        display_results(&results, &OutputFormat::Json);
+        display_results(&results, &OutputFormat::Json, false);
     }
 
     #[test]
@@ -1473,14 +1680,14 @@ mod tests {
             chunk_header: "".into(),
             chunk_text: "".into(),
         }];
-        display_results(&results, &OutputFormat::List);
+        display_results(&results, &OutputFormat::List, false);
         // In list mode, entities should produce no output (no assertion needed, just no panic)
     }
 
     #[test]
     fn test_display_json_empty() {
         let results: Vec<SearchResult> = vec![];
-        display_results(&results, &OutputFormat::Json);
+        display_results(&results, &OutputFormat::Json, false);
         // Should print "[]" without panic
     }
 
@@ -1653,11 +1860,518 @@ mod tests {
             &[],
             true,
             &OutputFormat::List,
+            false,
         );
 
         assert!(
             res.is_ok(),
             "cmd_search --answer must succeed (generation model = summary_model): {res:?}"
         );
+    }
+
+    // ==================================================================
+    // RED — add-community-list (community-listing delta)
+    //
+    // Targets the NEW public surface:
+    //   * `CommunityCommands::List { db, level, limit, format }`
+    //   * `select_communities(conn, level, limit)`
+    //   * `community_list_json(conn, communities)`
+    // ==================================================================
+
+    #[test]
+    fn test_community_list_args_parse_all_flags() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "community",
+            "list",
+            "test.db",
+            "--level",
+            "2",
+            "--limit",
+            "5",
+            "--format",
+            "json",
+        ])
+        .expect("`community list` with flags should parse");
+
+        match cli.command {
+            Commands::Community {
+                action:
+                    CommunityCommands::List {
+                        db,
+                        level,
+                        limit,
+                        format,
+                    },
+            } => {
+                assert_eq!(db, "test.db");
+                assert_eq!(level, Some(2));
+                assert_eq!(limit, 5);
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected Commands::Community::List"),
+        }
+    }
+
+    #[test]
+    fn test_community_list_args_defaults() {
+        let cli = Cli::try_parse_from(["graphrag", "community", "list"])
+            .expect("`community list` without db should parse");
+
+        match cli.command {
+            Commands::Community {
+                action:
+                    CommunityCommands::List {
+                        db,
+                        level,
+                        limit,
+                        format,
+                    },
+            } => {
+                assert_eq!(db, "graphrag.db");
+                assert_eq!(level, None);
+                assert_eq!(limit, 50);
+                assert!(matches!(format, OutputFormat::Table));
+            }
+            _ => panic!("expected Commands::Community::List"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_community_list_select_and_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("c.db").to_string_lossy().into_owned();
+
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+
+            for (id, label) in [(1_i64, "Python"), (2, "FastAPI")] {
+                conn.execute(
+                    "INSERT INTO nodes (id, key, label, type) VALUES (?1, ?2, ?3, 'entity')",
+                    rusqlite::params![id, crate::db::keys::node_key(label), label],
+                )
+                .unwrap();
+            }
+
+            for (label, level, members) in [
+                ("c_l1_a", 1, vec![1_i64, 2]),
+                ("c_l1_b", 1, vec![1_i64]),
+                ("c_l2_a", 2, vec![2_i64]),
+            ] {
+                let c = crate::db::communities::Community {
+                    id: 0,
+                    label: label.into(),
+                    level,
+                    parent_id: None,
+                    summary: None,
+                    summary_embedding: None,
+                    member_ids: members.clone(),
+                    member_count: members.len() as i32,
+                    algorithm: "leiden".into(),
+                    quality_fn: "cpm".into(),
+                    resolution: 1.0,
+                    summary_model: None,
+                    embed_model: None,
+                    summary_tokens: None,
+                    keywords: vec!["kw".into()],
+                    topics: vec!["tp".into()],
+                };
+                crate::db::communities::insert_community(&conn, &c).unwrap();
+            }
+        }
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+
+        // No level filter → all 3, ordered by (level, id).
+        let all = select_communities(&conn, None, 0).expect("select should succeed");
+        assert_eq!(all.len(), 3, "should list all 3 communities");
+        assert_eq!(all[0].level, 1, "must be ordered level-ascending");
+        assert_eq!(all[0].label, "c_l1_a", "then id-ascending");
+
+        // Level filter.
+        let l2 = select_communities(&conn, Some(2), 0).expect("select should succeed");
+        assert_eq!(l2.len(), 1, "only 1 community at level 2");
+        assert_eq!(l2[0].label, "c_l2_a");
+
+        // Limit.
+        let limited = select_communities(&conn, None, 2).expect("select should succeed");
+        assert_eq!(limited.len(), 2, "limit must truncate to 2");
+
+        // JSON output with members/keywords/topics.
+        let json = community_list_json(&conn, &l2).expect("json should succeed");
+        let value: serde_json::Value =
+            serde_json::from_str(&json).expect("community list JSON must be valid");
+        let arr = value.as_array().expect("must be a JSON array");
+        assert_eq!(arr.len(), 1);
+        assert!(arr[0]["keywords"].is_array(), "keywords must be an array");
+        assert!(arr[0]["topics"].is_array(), "topics must be an array");
+        assert_eq!(
+            arr[0]["members"],
+            serde_json::json!(["FastAPI"]),
+            "members must resolve to entity labels"
+        );
+
+        // Empty list → [].
+        let empty = community_list_json(&conn, &[]).expect("empty json should succeed");
+        assert_eq!(empty.trim(), "[]", "empty list must render as []");
+    }
+
+    // T-a — `cmd_community_list` on an initialized but empty `communities`
+    // table succeeds (exit 0) in both formats (spec: "Empty communities table").
+    #[test]
+    fn test_cmd_community_list_empty_table_is_ok() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("empty.db").to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+        }
+
+        assert!(
+            cmd_community_list(&db, None, 50, OutputFormat::Table).is_ok(),
+            "empty communities table must exit 0 (table format)"
+        );
+        assert!(
+            cmd_community_list(&db, None, 50, OutputFormat::Json).is_ok(),
+            "empty communities table must exit 0 (json format)"
+        );
+    }
+
+    // T-b — `cmd_community_list` on a database without a `communities` table
+    // returns an error (exit != 0) with an actionable message.
+    #[test]
+    fn test_cmd_community_list_missing_table_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("nodb.db").to_string_lossy().into_owned();
+
+        // The file does not exist: `Connection::open` creates it empty.
+        let err = cmd_community_list(&db, None, 50, OutputFormat::Table)
+            .expect_err("a missing communities table must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("communities") && msg.contains("init db"),
+            "error must mention the missing table and the fix, got: {msg}"
+        );
+    }
+
+    // T-d — `--limit 0` means "no limit" (must not truncate); a positive
+    // limit still truncates.
+    #[test]
+    fn test_select_communities_limit_zero_means_no_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("lim.db").to_string_lossy().into_owned();
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+            for i in 0..5 {
+                let c = crate::db::communities::Community {
+                    id: 0,
+                    label: format!("c-{i}"),
+                    level: 1,
+                    parent_id: None,
+                    summary: None,
+                    summary_embedding: None,
+                    member_ids: vec![],
+                    member_count: 0,
+                    algorithm: "leiden".into(),
+                    quality_fn: "cpm".into(),
+                    resolution: 1.0,
+                    summary_model: None,
+                    embed_model: None,
+                    summary_tokens: None,
+                    keywords: vec![],
+                    topics: vec![],
+                };
+                crate::db::communities::insert_community(&conn, &c).unwrap();
+            }
+        }
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let all = select_communities(&conn, None, 0).expect("select should succeed");
+        assert_eq!(all.len(), 5, "limit 0 must not truncate");
+        let three = select_communities(&conn, None, 3).expect("select should succeed");
+        assert_eq!(three.len(), 3, "limit 3 must truncate to 3");
+    }
+
+    // ==================================================================
+    // RED — fix-community-schema-migration (community-listing delta)
+    //
+    // `cmd_community_list` MUST migrate the schema (v2 → v3) before listing,
+    // so its `keywords`/`topics` SELECT works on a legacy database.
+    // ==================================================================
+
+    /// RED-3 — `cmd_community_list` over a v2 database with communities
+    /// succeeds and leaves the database at `user_version=3`.
+    #[test]
+    fn test_cmd_community_list_migrates_v2_db() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("v2.db").to_string_lossy().into_owned();
+
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::db::schema::init_db(&conn).unwrap();
+
+            // A pre-existing community that must survive and be listed.
+            let c = crate::db::communities::Community {
+                id: 0,
+                label: "legacy".into(),
+                level: 1,
+                parent_id: None,
+                summary: None,
+                summary_embedding: None,
+                member_ids: vec![1, 2],
+                member_count: 2,
+                algorithm: "leiden".into(),
+                quality_fn: "cpm".into(),
+                resolution: 1.0,
+                summary_model: None,
+                embed_model: None,
+                summary_tokens: None,
+                keywords: vec![],
+                topics: vec![],
+            };
+            crate::db::communities::insert_community(&conn, &c).unwrap();
+
+            // Downgrade to the v2 shape (no keywords/topics columns).
+            conn.execute_batch(
+                "ALTER TABLE communities DROP COLUMN keywords;
+                 ALTER TABLE communities DROP COLUMN topics;
+                 PRAGMA user_version=2;",
+            )
+            .unwrap();
+        }
+
+        let uv_before: i64 = {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(uv_before, 2, "fixture must start at v2");
+
+        cmd_community_list(&db, None, 50, OutputFormat::Table)
+            .expect("community list on a v2 db must migrate and succeed");
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let uv: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(uv, 3, "community list must migrate the db to v3");
+    }
+
+    // ==================================================================
+    // RED — add-search-no-content (output-format + similar-command deltas)
+    //
+    // Targets the NEW public surface in this binary and therefore does
+    // not compile until the GREEN phase lands:
+    //   * `render_results(results, format, no_content, out) -> io::Result<()>`
+    //   * `Commands::{Search,Similar,Fts} { no_content, .. }`
+    // ==================================================================
+
+    fn render_to_string(
+        results: &[SearchResult],
+        format: &OutputFormat,
+        no_content: bool,
+    ) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        render_results(results, format, no_content, &mut buf).expect("render debe funcionar");
+        String::from_utf8(buf).expect("utf-8")
+    }
+
+    /// A single `note` result whose chunk carries a header (so the preview
+    /// block renders by default) and whose neighbor list is non-empty.
+    fn no_content_sample_result() -> SearchResult {
+        use crate::graph::expand::Neighbor;
+        SearchResult {
+            id: 1,
+            label: "search-hybrida".into(),
+            r#type: "note".into(),
+            score: 0.917,
+            content:
+                "## La consulta base: ```bash\ngraphrag search \"servidor web seguro\" grafo.db -k 5\n```"
+                    .into(),
+            file: "Podcasts/guiones/0841/ejemplos-0841/search-hybrida.md".into(),
+            neighbors: vec![Neighbor {
+                id: 2,
+                label: "Docker".into(),
+                r#type: "entity".into(),
+                distance: 1,
+            }],
+            chunk_header: "Introduction".into(),
+            chunk_text: "graphrag search \"servidor web seguro\" grafo.db -k 5".into(),
+        }
+    }
+
+    // RED-1 — `--no-content` omits the preview but keeps the score line.
+    #[test]
+    fn test_render_results_no_content_omits_preview() {
+        let results = vec![no_content_sample_result()];
+        let text = render_to_string(&results, &OutputFormat::Table, true);
+
+        assert!(
+            text.contains("search-hybrida"),
+            "label must remain:\n{text}"
+        );
+        assert!(text.contains("0.917"), "score must remain:\n{text}");
+        assert!(
+            text.contains("search-hybrida.md"),
+            "file must remain:\n{text}"
+        );
+        assert!(
+            text.contains("(vecinos: 1)"),
+            "neighbor count must remain:\n{text}"
+        );
+        assert!(!text.contains("└──"), "preview must be omitted:\n{text}");
+    }
+
+    // RED-2 — regression guard: default output keeps the preview.
+    #[test]
+    fn test_render_results_default_keeps_preview() {
+        let results = vec![no_content_sample_result()];
+        let text = render_to_string(&results, &OutputFormat::Table, false);
+
+        assert!(
+            text.contains("└── Introduction:"),
+            "default output must keep the preview:\n{text}"
+        );
+        assert!(
+            text.contains("servidor web seguro"),
+            "default preview must keep the chunk text:\n{text}"
+        );
+    }
+
+    // RED-3 — the neighbor block of the first result survives `--no-content`.
+    #[test]
+    fn test_render_results_no_content_keeps_neighbors() {
+        let results = vec![no_content_sample_result()];
+        let text = render_to_string(&results, &OutputFormat::Table, true);
+
+        assert!(
+            text.contains("🔗 Vecinos de 'search-hybrida'"),
+            "neighbor block header must remain:\n{text}"
+        );
+        assert!(
+            text.contains("Docker"),
+            "neighbor label must remain:\n{text}"
+        );
+    }
+
+    // RED-4a — `--no-content` is a no-op in list format.
+    #[test]
+    fn test_render_results_no_content_is_noop_for_list() {
+        let results = vec![no_content_sample_result()];
+        let with = render_to_string(&results, &OutputFormat::List, true);
+        let without = render_to_string(&results, &OutputFormat::List, false);
+        assert_eq!(with, without, "--no-content must be a no-op in list format");
+    }
+
+    // RED-4b — `--no-content` is a no-op in json format.
+    #[test]
+    fn test_render_results_no_content_is_noop_for_json() {
+        let results = vec![no_content_sample_result()];
+        let with = render_to_string(&results, &OutputFormat::Json, true);
+        let without = render_to_string(&results, &OutputFormat::Json, false);
+        assert_eq!(with, without, "--no-content must be a no-op in json format");
+    }
+
+    // RED-6 — an empty table plus `--no-content` hits the early return and
+    // yields exactly the "no results" line.
+    #[test]
+    fn test_render_results_empty_table_with_no_content() {
+        let results: Vec<SearchResult> = vec![];
+        let text = render_to_string(&results, &OutputFormat::Table, true);
+
+        assert_eq!(text, "   (sin resultados)\n");
+        assert!(
+            !text.contains("└──"),
+            "no preview on empty results:\n{text}"
+        );
+    }
+
+    // RED-7 — a content longer than 200 chars is truncated to 200 chars plus
+    // an ellipsis, and `--no-content` still drops the whole preview.
+    #[test]
+    fn test_render_results_truncates_long_preview() {
+        let mut result = no_content_sample_result();
+        result.content = "a".repeat(250);
+
+        let kept = render_to_string(std::slice::from_ref(&result), &OutputFormat::Table, false);
+        assert!(
+            kept.contains(&format!("└── Introduction: {}...", "a".repeat(200))),
+            "preview must truncate to 200 chars + ellipsis:\n{kept}"
+        );
+
+        let hidden = render_to_string(std::slice::from_ref(&result), &OutputFormat::Table, true);
+        assert!(
+            !hidden.contains("└──"),
+            "preview must be omitted:\n{hidden}"
+        );
+    }
+
+    // RED-5a — `search` accepts `--no-content`.
+    #[test]
+    fn test_search_args_parse_no_content() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "search",
+            "servidor web seguro",
+            "test.db",
+            "--no-content",
+        ])
+        .expect("search --no-content should parse");
+        match cli.command {
+            Commands::Search { no_content, .. } => assert!(no_content, "--no-content sets true"),
+            _ => panic!("expected Commands::Search"),
+        }
+
+        let cli = Cli::try_parse_from(["graphrag", "search", "servidor web seguro", "test.db"])
+            .expect("search without --no-content should parse");
+        match cli.command {
+            Commands::Search { no_content, .. } => assert!(!no_content, "default must be false"),
+            _ => panic!("expected Commands::Search"),
+        }
+    }
+
+    // RED-5b — `similar` accepts `--no-content`.
+    #[test]
+    fn test_similar_args_parse_no_content() {
+        let cli = Cli::try_parse_from([
+            "graphrag",
+            "similar",
+            "--label",
+            "Python",
+            "test.db",
+            "--no-content",
+        ])
+        .expect("similar --no-content should parse");
+        match cli.command {
+            Commands::Similar { no_content, .. } => assert!(no_content, "--no-content sets true"),
+            _ => panic!("expected Commands::Similar"),
+        }
+
+        let cli = Cli::try_parse_from(["graphrag", "similar", "--label", "Python", "test.db"])
+            .expect("similar without --no-content should parse");
+        match cli.command {
+            Commands::Similar { no_content, .. } => assert!(!no_content, "default must be false"),
+            _ => panic!("expected Commands::Similar"),
+        }
+    }
+
+    // RED-5c — `fts` accepts `--no-content`.
+    #[test]
+    fn test_fts_args_parse_no_content() {
+        let cli = Cli::try_parse_from(["graphrag", "fts", "Docker", "test.db", "--no-content"])
+            .expect("fts --no-content should parse");
+        match cli.command {
+            Commands::Fts { no_content, .. } => assert!(no_content, "--no-content sets true"),
+            _ => panic!("expected Commands::Fts"),
+        }
+
+        let cli = Cli::try_parse_from(["graphrag", "fts", "Docker", "test.db"])
+            .expect("fts without --no-content should parse");
+        match cli.command {
+            Commands::Fts { no_content, .. } => assert!(!no_content, "default must be false"),
+            _ => panic!("expected Commands::Fts"),
+        }
     }
 }

@@ -818,6 +818,9 @@ fn handle_resource_edges(db_path: &str, _type_filter: Option<&str>) -> Result<St
 
 fn handle_resource_communities(db_path: &str) -> Result<String> {
     let conn = rusqlite::Connection::open(db_path)?;
+    // Apply the idempotent schema migrations before reading, so the
+    // `keywords`/`topics` SELECT works on a legacy (v2) database.
+    crate::db::schema::init_db(&conn)?;
     let communities = crate::db::communities::get_all_communities(&conn)?;
     let json = serde_json::to_string_pretty(
         &communities
@@ -829,6 +832,8 @@ fn handle_resource_communities(db_path: &str) -> Result<String> {
                     "level": c.level,
                     "parent_id": c.parent_id,
                     "summary": c.summary,
+                    "keywords": c.keywords,
+                    "topics": c.topics,
                     "member_count": c.member_count,
                     "algorithm": c.algorithm,
                     "summary_tokens": c.summary_tokens,
@@ -844,6 +849,9 @@ fn handle_resource_community_by_id(db_path: &str, id_str: &str) -> Result<String
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid community ID: {}", id_str))?;
     let conn = rusqlite::Connection::open(db_path)?;
+    // Apply the idempotent schema migrations before reading, so the
+    // `keywords`/`topics` SELECT works on a legacy (v2) database.
+    crate::db::schema::init_db(&conn)?;
     let community = crate::db::communities::get_community_by_id(&conn, id)?
         .ok_or_else(|| anyhow::anyhow!("Community not found: {}", id))?;
     let json = serde_json::to_string_pretty(&serde_json::json!({
@@ -852,6 +860,8 @@ fn handle_resource_community_by_id(db_path: &str, id_str: &str) -> Result<String
         "level": community.level,
         "parent_id": community.parent_id,
         "summary": community.summary,
+        "keywords": community.keywords,
+        "topics": community.topics,
         "member_ids": community.member_ids,
         "member_count": community.member_count,
         "algorithm": community.algorithm,
