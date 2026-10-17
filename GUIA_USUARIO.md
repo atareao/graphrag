@@ -266,6 +266,7 @@ contenido, ruta y vecinos.
 | `-a` / `--alpha` | Peso vectorial. `0.0` = solo grafo, `1.0` = solo vector. |
 | `--min-weight` | Peso mínimo de arista para que un vecino entre en la expansión. |
 | `--notes-only` | Oculta entidades y tags; solo notas. |
+| `--no-content` | Omitir el contenido (preview del chunk) en la salida de tabla. |
 
 > **Importante:** `search` **necesita Ollama** para embeber la consulta. No hay fallback sin Ollama en tiempo de búsqueda: si Ollama no responde, `search` falla con error de conexión. Para búsqueda puramente vectorial sobre embeddings ya almacenados usa `-d 0`.
 
@@ -361,6 +362,7 @@ Encuentra notas semánticamente similares a una nota ya indexada o a un archivo 
 | `--notes-only` | — | Solo notas (sin entidades ni tags). |
 | `--filter <EXPR>` | — | Filtro de metadatos (repetible). |
 | `--format <FORMAT>` | `table` | `table` \| `list` \| `json`. |
+| `--no-content` | — | Omitir el contenido (preview del chunk) en la salida de tabla. |
 
 **Regla:** debes indicar **exactamente uno** de `--label` o `--file`. Si indicas ambos o ninguno, el comando falla con error y sale con código 1.
 
@@ -390,6 +392,7 @@ Búsqueda híbrida (vectores + grafo).
 | `--filter <EXPR>` | — | Filtro de metadatos (repetible). |
 | `--answer` | — | Respuesta narrativa usando contexto de comunidades (requiere `community detect` + `community summarize`). |
 | `--format <FORMAT>` | `table` | `table` \| `list` \| `json`. |
+| `--no-content` | — | Omitir el contenido (preview del chunk) en la salida de tabla. |
 
 > No existe `--vector-only` ni `--ollama`. Para búsqueda solo vectorial, usa `-d 0`. La conexión a Ollama se controla con `--ollama-url`.
 
@@ -491,6 +494,7 @@ Búsqueda textual exacta con FTS5.
 | `-l, --limit <LIMIT>` | `10` | Número de resultados. |
 | `--notes-only` | — | Solo notas (oculta entidades y tags). |
 | `--format <FORMAT>` | `table` | `table` \| `list` \| `json`. |
+| `--no-content` | — | Omitir el contenido (preview del chunk) en la salida de tabla. |
 
 ```bash
 graphrag fts "Python" graph.db -l 20
@@ -1028,12 +1032,12 @@ graphrag mcp --db graph.db
 | `init db` | `[DB]` | — |
 | `init neovim` | — | `-o/--output` |
 | `build` | `[REPO] [DB]` | `--embed-model`, `--ner-model`, `--ollama-url` |
-| `similar` | `[DB]` | `--label`, `--file`, `-k`, `-d`, `--min-weight`, `--notes-only`, `--filter`, `--format` |
-| `search` | `<QUERY> [DB]` | `-k`, `-d`, `-a`, `--ollama-url`, `--embed-model`, `--min-weight`, `--notes-only`, `--filter`, `--answer`, `--format` |
+| `similar` | `[DB]` | `--label`, `--file`, `-k`, `-d`, `--min-weight`, `--notes-only`, `--filter`, `--format`, `--no-content` |
+| `search` | `<QUERY> [DB]` | `-k`, `-d`, `-a`, `--ollama-url`, `--embed-model`, `--min-weight`, `--notes-only`, `--filter`, `--answer`, `--format`, `--no-content` |
 | `ask` | `<QUERY> [DB]` | `-k`, `-d`, `-a`, `--ollama-url`, `--embed-model`, `--min-weight`, `--notes-only`, `--filter`, `--communities`, `--model`, `--format` |
 | `graph` | `<LABEL> [DB]` | `-d` |
 | `map` | `[DB]` | `--from`, `-d` |
-| `fts` | `<QUERY> [DB]` | `-l`, `--notes-only`, `--format` |
+| `fts` | `<QUERY> [DB]` | `-l`, `--notes-only`, `--format`, `--no-content` |
 | `path` | `<FROM> <TO> [DB]` | `-m/--max-depth` |
 | `seed` | `[DB]` | `--ollama-url`, `--embed-model` |
 | `reset` | `[DB]` | — |
